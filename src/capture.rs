@@ -1413,6 +1413,24 @@ fn overlay_js(opts: &Opts) -> String {
     tag.style.top = ly + "px";
     tag.style.visibility = "visible";
     boxes.push({{ x: lx, y: ly, width: tw, height: th }});
+    // Leader arrow from the marker to the label, painted beneath both.
+    const x1 = mx + 15, y1 = my + 15;
+    const x2 = lx + tw / 2, y2 = ly + th / 2;
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    if (len > 20) {{
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      const arrow = document.createElement("div");
+      arrow.dataset.iris = "arrow";
+      arrow.style.cssText = "position:absolute;left:" + x1 + "px;top:" + (y1 - 2) + "px;"
+        + "width:" + len + "px;height:4px;background:" + ORANGE + ";"
+        + "transform:rotate(" + angle + "rad);transform-origin:0 50%;"
+        + "z-index:2147483647;pointer-events:none;margin:0;padding:0;";
+      document.body.insertBefore(arrow, marker);
+      boxes.push({{
+        x: Math.min(x1, x2) - 3, y: Math.min(y1, y2) - 3,
+        width: Math.abs(x2 - x1) + 6, height: Math.abs(y2 - y1) + 6,
+      }});
+    }}
   }};
   for (const point of points) {{
     const element = find(point.selector);
@@ -1774,6 +1792,7 @@ mod tests {
             mask_patterns: Vec::new(),
         };
         let js = overlay_js(&opts);
+        assert!(js.contains("rotate("));
         assert!(js.contains(
             r##"{"label":"Find \"quoted\" \\ done","number":2,"selector":"#search"}"##,
         ));
