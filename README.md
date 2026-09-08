@@ -149,6 +149,44 @@ Element capture is intentionally CSS-selector based: Iris captures the first mat
 {"status":"ok","url":"https://example.com/","output":"/absolute/example.com.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}
 ```
 
+## Repeatable workflows
+
+Put the URL, viewport, interactions, redactions, annotations, selector, and
+output filename in a YAML or JSON recipe, then run the same documentation
+screenshots locally and in CI:
+
+```yaml
+url: https://app.example.com
+size: desktop
+steps:
+  - click: "text=Conditions"
+redact:
+  - ".client-name"
+annotations:
+  - selector: "#search"
+    number: 1
+    label: Find a condition
+  - selector: "#run-analysis"
+    number: 2
+    label: Review documents
+output: shots/conditions.png
+```
+
+```sh
+iris --workflow docs/conditions.yaml --json   # repeatable; --workflow is repeatable too
+iris --workflow docs/conditions.yaml --dry-run  # print the resolved plan without launching Chrome
+```
+
+Recipes validate strictly (unknown fields fail fast naming the field) and
+share one code path with MCP `capture`, so a file, a flag invocation, and a
+tool call with the same values capture identically. Recipes carry their own
+capture spec including timeout; `--jobs`, `--chrome`, and `--json` still
+apply. In CI:
+
+```yaml
+- run: iris --workflow docs/conditions.yaml --json
+```
+
 ## Benchmarking
 
 Capture time includes navigation and Iris's correctness waits, so compare the same URL, capture mode, viewport, scale, Chrome version, and hardware. Prefer a deterministic local page when comparing releases; public URLs add network and server variance.

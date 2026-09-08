@@ -1,5 +1,6 @@
 mod capture;
 mod mcp;
+mod workflow;
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -64,8 +65,28 @@ struct LoginArgs {
 #[derive(Args)]
 struct CaptureArgs {
     /// URLs to capture; `-` reads newline-separated URLs from stdin
-    #[arg(required = true, value_name = "URL")]
+    #[arg(required_unless_present = "workflow", value_name = "URL")]
     urls: Vec<String>,
+
+    /// Run recipe files instead of flags: URL, viewport, steps, redactions,
+    /// annotations, selector, session, and output per file (repeatable).
+    /// Recipes carry their own capture spec, including timeout; --jobs,
+    /// --chrome, and --json still apply. Use --dry-run to print the plan.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "urls", "out", "size", "full", "selector", "padding", "dark", "light",
+            "color_scheme", "format", "wait", "wait_for", "click", "fill", "hover",
+            "press", "mask", "mask_blur", "mask_patterns", "point", "highlight",
+            "dim", "scale", "session",
+        ]
+    )]
+    workflow: Vec<PathBuf>,
+
+    /// Print the resolved workflow plan as JSON without launching Chrome
+    #[arg(long, requires = "workflow")]
+    dry_run: bool,
 
     /// Output file (single URL) or directory (batch) [default: ./<host>-<path>.png]
     #[arg(short, long, value_name = "PATH")]
@@ -207,6 +228,9 @@ async fn run_login(args: LoginArgs) -> Result<()> {
 }
 
 async fn run_capture(cli: CaptureArgs) -> Result<()> {
+    if !cli.workflow.is_empty() {
+        return run_workflows(cli).await;
+    }
     let urls = collect_urls(&cli.urls)?;
     let viewport = parse_viewport(&cli.size, cli.scale)?;
     let mode = capture_mode(&cli);
@@ -264,29 +288,7 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
     while let Some((url, path, result)) = stream.next().await {
         match result {
             Ok(shot) => {
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&success_report(
-                            url.as_str(),
-                            Some(&path),
-                            &mode,
-                            format,
-                            &shot,
-                            opts.annotations.len(),
-                            opts.color_scheme,
-                        ))?
-                    );
-                } else {
-                    println!(
-                        "\u{2713} {} \u{2014} {}\u{d7}{} @{}x, {}",
-                        path.display(),
-                        shot.width,
-                        shot.height,
-                        shot.scale,
-                        human_size(shot.bytes),
-                    );
-                }
+                report_success(cli.json, url.as_str(), &path, &opts, &shot)?;
             }
             Err(err) => {
                 failed += 1;
@@ -316,6 +318,163 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Run recipe files: load and validate everything first (typos fail before
+/// Chrome launches), then capture concurrently across one browser per session.
+async fn run_workflows(cli: CaptureArgs) -> Result<()> {
+    let mut prepared = Vec::new();
+    for file in &cli.workflow {
+        let recipe = workflow::load_recipe(file)?;
+        let request = mcp::CaptureRequest::from(recipe);
+        prepared.push(
+            request
+                .prepare()
+                .map_err(|err| anyhow::anyhow!("{}: {err:#}", file.display()))?,
+        );
+    }
+    if cli.dry_run {
+        for capture in &prepared {
+            println!("{}", workflow_plan(capture)?);
+        }
+        return Ok(());
+    }
+
+    let jobs = cli.jobs.unwrap_or_else(|| prepared.len().min(4)).max(1);
+    let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
+    let mut launched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for capture in &prepared {
+        let key = capture.session.clone().unwrap_or_default();
+        if !launched.insert(key.clone()) {
+            continue;
+        }
+        let session = if key.is_empty() {
+            Session::launch(cli.chrome.clone(), capture::Viewport::desktop()).await?
+        } else {
+            let dir = capture::resolve_session_dir(&key)?;
+            Session::launch_with_profile(cli.chrome.clone(), capture::Viewport::desktop(), dir)
+                .await?
+        };
+        sessions.insert(key, Arc::new(session));
+    }
+    let sessions = Arc::new(sessions);
+
+    let mut failed = 0usize;
+    let mut stream = futures::stream::iter(prepared)
+        .map({
+            let sessions = Arc::clone(&sessions);
+            move |capture: mcp::PreparedCapture| {
+                let sessions = Arc::clone(&sessions);
+                async move {
+                    let key = capture.session.clone().unwrap_or_default();
+                    let session = Arc::clone(sessions.get(&key).expect("session pre-launched"));
+                    let url = capture.url.clone();
+                    let result = match session.capture(url.as_str(), &capture.opts).await {
+                        Ok(image) => match &capture.output {
+                            Some(path) => image
+                                .write_to(path)
+                                .await
+                                .map(|()| (path.clone(), image.shot)),
+                            None => Err(anyhow::anyhow!("workflow is missing its output path")),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    (capture, result)
+                }
+            }
+        })
+        .buffer_unordered(jobs);
+
+    while let Some((capture, result)) = stream.next().await {
+        let url = capture.url.as_str();
+        match result {
+            Ok((path, shot)) => {
+                report_success(cli.json, url, &path, &capture.opts, &shot)?;
+            }
+            Err(err) => {
+                failed += 1;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&capture::error_report(
+                            url,
+                            capture.output.as_deref(),
+                            &capture.opts.mode,
+                            format!("{err:#}"),
+                        ))?
+                    );
+                } else {
+                    eprintln!("\u{2717} {url} \u{2014} {err:#}");
+                }
+            }
+        }
+    }
+
+    drop(stream);
+    if let Ok(sessions) = Arc::try_unwrap(sessions) {
+        for (_, session) in sessions {
+            if let Ok(session) = Arc::try_unwrap(session) {
+                session.close().await;
+            }
+        }
+    }
+
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn report_success(
+    json: bool,
+    url: &str,
+    path: &std::path::Path,
+    opts: &Opts,
+    shot: &capture::Shot,
+) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&success_report(
+                url,
+                Some(path),
+                &opts.mode,
+                opts.format,
+                shot,
+                opts.annotations.len(),
+                opts.color_scheme,
+            ))?
+        );
+    } else {
+        println!(
+            "\u{2713} {} \u{2014} {}\u{d7}{} @{}x, {}",
+            path.display(),
+            shot.width,
+            shot.height,
+            shot.scale,
+            human_size(shot.bytes),
+        );
+    }
+    Ok(())
+}
+
+/// Resolved workflow plan for `--dry-run`: everything except pixels.
+fn workflow_plan(capture: &mcp::PreparedCapture) -> Result<String> {
+    let mode = &capture.opts.mode;
+    Ok(serde_json::to_string(&serde_json::json!({
+        "status": "ok",
+        "url": capture.url.as_str(),
+        "output": capture.output.as_ref().map(|path| capture::absolute_output(path)),
+        "mode": mode.name(),
+        "selector": mode.selector(),
+        "padding": mode.padding(),
+        "color_scheme": capture.opts.color_scheme.name(),
+        "format": capture.opts.format.ext(),
+        "session": capture.session,
+        "steps": capture.opts.steps.len(),
+        "annotations": capture.opts.annotations.len(),
+        "masks": capture.opts.masks.len(),
+    }))?)
 }
 
 /// Pair up flat `--point SELECTOR LABEL` values; numbering follows flag order.

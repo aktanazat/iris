@@ -176,15 +176,54 @@ impl ImageFormat {
 }
 
 #[derive(Debug)]
-struct PreparedCapture {
-    url: url::Url,
-    output: Option<PathBuf>,
-    session: Option<String>,
-    opts: Opts,
+pub(crate) struct PreparedCapture {
+    pub(crate) url: url::Url,
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) session: Option<String>,
+    pub(crate) opts: Opts,
+}
+
+/// Workflow recipes convert into capture requests so CLI files, MCP calls,
+/// and CLI flags all validate through the same `prepare` path.
+impl From<crate::workflow::Recipe> for CaptureRequest {
+    fn from(recipe: crate::workflow::Recipe) -> Self {
+        Self {
+            url: recipe.url,
+            selector: recipe.selector,
+            padding: recipe.padding,
+            full_page: recipe.full,
+            size: recipe.size,
+            dark: false,
+            color_scheme: recipe.color_scheme,
+            format: recipe.format,
+            wait_ms: recipe.wait_ms,
+            wait_for: recipe.wait_for,
+            scale: recipe.scale,
+            timeout_seconds: recipe.timeout_seconds,
+            output: Some(recipe.output),
+            steps: Some(recipe.steps),
+            redact: Some(recipe.redact),
+            mask_blur_px: recipe.mask_blur_px,
+            redact_patterns: Some(recipe.redact_patterns),
+            annotations: Some(
+                recipe
+                    .annotations
+                    .into_iter()
+                    .map(|point| AnnotationRequest {
+                        selector: point.selector,
+                        label: point.label,
+                    })
+                    .collect(),
+            ),
+            highlight: Some(recipe.highlight),
+            dim: recipe.dim,
+            session: recipe.session,
+        }
+    }
 }
 
 impl CaptureRequest {
-    fn prepare(self) -> Result<PreparedCapture> {
+    pub(crate) fn prepare(self) -> Result<PreparedCapture> {
         let url = normalize_url(self.url.trim())?;
         let selector_supplied = self.selector.is_some();
         let selector = self
@@ -901,6 +940,94 @@ mod tests {
                 .to_string()
                 .contains("invalid session name")
         );
+    }
+
+    #[test]
+    fn recipe_and_request_with_same_values_prepare_identically() {
+        let recipe: crate::workflow::Recipe = serde_saphyr::from_str(
+            r##"
+url: example.com
+size: 800x600
+scale: 1.5
+selector: "#main"
+padding: 10
+color_scheme: dark
+session: matteros
+format: jpg
+wait_ms: 100
+wait_for: "#ready"
+timeout_seconds: 12
+steps:
+  - click: "#open"
+  - {fill: "#q", text: "hi"}
+  - hover: "#menu"
+  - press: Enter
+  - wait_for: "#done"
+redact: ["[data-private]"]
+mask_blur_px: 4
+redact_patterns: [email, ssn]
+annotations:
+  - selector: "#q"
+    label: Type here
+highlight: ["#go"]
+dim: true
+output: shots/all.png
+"##,
+        )
+        .unwrap();
+        let from_recipe = CaptureRequest::from(recipe).prepare().unwrap();
+        let from_request = CaptureRequest {
+            url: "example.com".into(),
+            selector: Some("#main".into()),
+            padding: Some(10),
+            full_page: false,
+            size: Some("800x600".into()),
+            dark: false,
+            color_scheme: Some(ColorSchemeRequest::Dark),
+            format: Some(ImageFormat::Jpg),
+            wait_ms: 100,
+            wait_for: Some("#ready".into()),
+            scale: Some(1.5),
+            timeout_seconds: Some(12),
+            output: Some(PathBuf::from("shots/all.png")),
+            steps: Some(vec![
+                StepRequest::Click {
+                    click: "#open".into(),
+                },
+                StepRequest::Fill {
+                    fill: "#q".into(),
+                    text: "hi".into(),
+                },
+                StepRequest::Hover {
+                    hover: "#menu".into(),
+                },
+                StepRequest::Press {
+                    press: "Enter".into(),
+                },
+                StepRequest::WaitFor {
+                    wait_for: "#done".into(),
+                },
+            ]),
+            redact: Some(vec!["[data-private]".into()]),
+            mask_blur_px: Some(4),
+            redact_patterns: Some(vec![RedactPattern::Email, RedactPattern::Ssn]),
+            annotations: Some(vec![AnnotationRequest {
+                selector: "#q".into(),
+                label: "Type here".into(),
+            }]),
+            highlight: Some(vec!["#go".into()]),
+            dim: true,
+            session: Some("matteros".into()),
+        }
+        .prepare()
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", from_recipe.opts),
+            format!("{:?}", from_request.opts)
+        );
+        assert_eq!(from_recipe.url, from_request.url);
+        assert_eq!(from_recipe.output, from_request.output);
+        assert_eq!(from_recipe.session, from_request.session);
     }
 
     #[test]
