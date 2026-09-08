@@ -104,6 +104,18 @@ struct CaptureArgs {
     #[arg(long, value_name = "KEY")]
     press: Vec<String>,
 
+    /// Redact elements: cover every match of this CSS selector (repeatable)
+    #[arg(long, value_name = "CSS")]
+    mask: Vec<String>,
+
+    /// Blur masked content instead of covering it with ink
+    #[arg(long, value_name = "PX")]
+    mask_blur: Option<u32>,
+
+    /// Also redact sensitive-data matches (repeatable, off by default)
+    #[arg(long, value_name = "NAME")]
+    mask_patterns: Vec<capture::MaskPattern>,
+
     /// Point a numbered marker and label at an element: --point SELECTOR LABEL
     /// (repeatable; numbering follows flag order)
     #[arg(long = "point", value_names = ["SELECTOR", "LABEL"], num_args = 2)]
@@ -170,6 +182,9 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         highlights: cli.highlight,
         dim: cli.dim,
         steps,
+        masks: cli.mask,
+        mask_blur_px: cli.mask_blur,
+        mask_patterns: cli.mask_patterns,
     });
 
     let session = Arc::new(Session::launch(cli.chrome, viewport).await?);
@@ -556,6 +571,36 @@ mod tests {
     }
 
     #[test]
+    fn mask_flags_parse_selectors_blur_and_pattern_names() {
+        let cli = Cli::try_parse_from([
+            "iris",
+            "example.com",
+            "--mask",
+            ".client-name",
+            "--mask",
+            "[data-private]",
+            "--mask-blur",
+            "6",
+            "--mask-patterns",
+            "email",
+            "--mask-patterns",
+            "ssn",
+        ])
+        .unwrap();
+        assert_eq!(cli.capture.mask, vec![".client-name", "[data-private]"]);
+        assert_eq!(cli.capture.mask_blur, Some(6));
+        assert_eq!(
+            cli.capture.mask_patterns,
+            vec![capture::MaskPattern::Email, capture::MaskPattern::Ssn,]
+        );
+
+        let error = Cli::try_parse_from(["iris", "example.com", "--mask-patterns", "passport"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn point_requires_both_selector_and_label() {
         let error = Cli::try_parse_from(["iris", "example.com", "--point", "#only-selector"])
             .err()
@@ -574,6 +619,7 @@ mod tests {
             height: 72,
             scale: 2.0,
             bytes: 14_231,
+            masked: 0,
         };
         let success = serde_json::to_string(&success_report(
             "https://example.com/",

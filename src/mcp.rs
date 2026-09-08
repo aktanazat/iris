@@ -50,6 +50,12 @@ pub struct CaptureRequest {
     wait_for: Option<String>,
     /// Ordered interactions to perform before capturing.
     steps: Option<Vec<StepRequest>>,
+    /// Redact elements: cover every match of each CSS selector.
+    redact: Option<Vec<String>>,
+    /// Blur masked content instead of covering it with ink.
+    mask_blur_px: Option<u32>,
+    /// Also redact sensitive-data matches (off by default).
+    redact_patterns: Option<Vec<RedactPattern>>,
     /// Numbered markers with labels pointing at elements, in list order.
     annotations: Option<Vec<AnnotationRequest>>,
     /// Outline the first element matching each CSS selector.
@@ -71,6 +77,27 @@ pub struct AnnotationRequest {
     selector: String,
     /// Short label shown beside the marker.
     label: String,
+}
+
+/// Opt-in sensitive-data detector for masking.
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RedactPattern {
+    Email,
+    Phone,
+    Ssn,
+    Account,
+}
+
+impl RedactPattern {
+    fn capture_pattern(self) -> crate::capture::MaskPattern {
+        match self {
+            Self::Email => crate::capture::MaskPattern::Email,
+            Self::Phone => crate::capture::MaskPattern::Phone,
+            Self::Ssn => crate::capture::MaskPattern::Ssn,
+            Self::Account => crate::capture::MaskPattern::Account,
+        }
+    }
 }
 
 /// One pre-capture interaction. Array order is the execution order.
@@ -248,6 +275,26 @@ impl CaptureRequest {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let masks = self
+            .redact
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, selector)| {
+                let selector = selector.trim().to_owned();
+                if selector.is_empty() {
+                    bail!("redact[{i}] must not be empty");
+                }
+                Ok(selector)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mask_patterns = self
+            .redact_patterns
+            .unwrap_or_default()
+            .into_iter()
+            .map(RedactPattern::capture_pattern)
+            .collect();
+
         let mut format = self
             .format
             .map(ImageFormat::capture_format)
@@ -276,6 +323,9 @@ impl CaptureRequest {
                 highlights,
                 dim: self.dim,
                 steps,
+                masks,
+                mask_blur_px: self.mask_blur_px,
+                mask_patterns,
             },
         })
     }
@@ -532,6 +582,9 @@ mod tests {
             highlight: None,
             dim: false,
             steps: None,
+            redact: None,
+            mask_blur_px: None,
+            redact_patterns: None,
         }
     }
 
@@ -683,6 +736,40 @@ mod tests {
                 .to_string()
                 .contains("steps[0].click must not be empty")
         );
+    }
+
+    #[test]
+    fn redact_requests_map_selectors_blur_and_patterns() {
+        let mut capture = request("example.com");
+        capture.redact = Some(vec![" .client-name ".into(), "[data-private]".into()]);
+        capture.mask_blur_px = Some(8);
+        capture.redact_patterns = Some(vec![RedactPattern::Email, RedactPattern::Account]);
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(prepared.opts.masks, vec![".client-name", "[data-private]"]);
+        assert_eq!(prepared.opts.mask_blur_px, Some(8));
+        assert_eq!(
+            prepared.opts.mask_patterns,
+            vec![
+                crate::capture::MaskPattern::Email,
+                crate::capture::MaskPattern::Account,
+            ]
+        );
+
+        let mut empty = request("example.com");
+        empty.redact = Some(vec!["  ".into()]);
+        assert!(
+            empty
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("redact[0] must not be empty")
+        );
+
+        let unknown: Result<CaptureRequest, _> = serde_json::from_value(serde_json::json!({
+            "url": "example.com",
+            "redact_patterns": ["passport"],
+        }));
+        assert!(unknown.is_err());
     }
 
     #[test]

@@ -160,11 +160,21 @@ pub struct Opts {
     pub highlights: Vec<String>,
     pub dim: bool,
     pub steps: Vec<InteractionStep>,
+    /// CSS selectors to redact; every match is covered (not just the first).
+    pub masks: Vec<String>,
+    /// Blur radius in px for masks; opaque ink when None.
+    pub mask_blur_px: Option<u32>,
+    /// Opt-in sensitive-data detectors; off when empty.
+    pub mask_patterns: Vec<MaskPattern>,
 }
 
 impl Opts {
     pub fn overlays_enabled(&self) -> bool {
         !self.annotations.is_empty() || !self.highlights.is_empty() || self.dim
+    }
+
+    pub fn masking_enabled(&self) -> bool {
+        !self.masks.is_empty() || !self.mask_patterns.is_empty()
     }
 }
 
@@ -192,6 +202,39 @@ impl InteractionStep {
     }
 }
 
+/// Opt-in sensitive-data detector for masking. Conservative by design:
+/// patterns require separators and word boundaries so plain numbers and
+/// order IDs are left alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaskPattern {
+    Email,
+    Phone,
+    Ssn,
+    Account,
+}
+
+impl MaskPattern {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Email => "email",
+            Self::Phone => "phone",
+            Self::Ssn => "ssn",
+            Self::Account => "account",
+        }
+    }
+
+    /// JavaScript `RegExp` source (no flags, no delimiters).
+    pub fn regex_source(self) -> &'static str {
+        match self {
+            Self::Email => r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            Self::Phone => r"(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\d{3})[-.\s]\d{3}[-.\s]\d{4}",
+            Self::Ssn => r"\b\d{3}-\d{2}-\d{4}\b",
+            Self::Account => r"\b\d{4}(?:[- ]\d{4}){2,3}\b",
+        }
+    }
+}
+
 /// One overlay box in document coordinates, returned by the in-page overlay
 /// script so element clips can grow to include nearby markers and labels.
 #[derive(Debug, Deserialize)]
@@ -211,6 +254,8 @@ pub struct Shot {
     /// ~16k texture limit fall back to 1x).
     pub scale: f64,
     pub bytes: u64,
+    /// Redaction boxes drawn before capture.
+    pub masked: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,6 +276,8 @@ pub struct SuccessReport {
     bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masked: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -268,6 +315,7 @@ pub fn success_report(
         format: format.ext(),
         bytes: shot.bytes,
         annotations: (annotations > 0).then_some(annotations),
+        masked: (shot.masked > 0).then_some(shot.masked),
     }
 }
 
@@ -488,8 +536,14 @@ impl Session {
             self.eval(page, SETTLE_JS.into()).await?;
         }
 
-        // Overlays are plain DOM nodes drawn after the last settle so markers sit
-        // on final layout. The tab closes after capture, so no cleanup is needed.
+        // Masks run before overlays so annotations can point at redacted boxes
+        // without leaking their text. Both are plain DOM nodes; the tab closes
+        // after capture, so no cleanup is needed.
+        let masked = if opts.masking_enabled() {
+            self.apply_masks(page, opts).await?
+        } else {
+            0
+        };
         let overlay_boxes = if opts.overlays_enabled() {
             self.apply_overlays(page, opts).await?
         } else {
@@ -586,6 +640,7 @@ impl Session {
                 height,
                 scale,
                 bytes,
+                masked,
             },
             data,
         })
@@ -629,6 +684,15 @@ impl Session {
     async fn apply_overlays(&self, page: &Page, opts: &Opts) -> Result<Vec<OverlayBox>> {
         let value = self.eval(page, overlay_js(opts)).await?;
         serde_json::from_value(value).context("failed to read overlay boxes")
+    }
+
+    /// Cover masked elements and sensitive-data matches in-page; return how
+    /// many boxes were drawn.
+    async fn apply_masks(&self, page: &Page, opts: &Opts) -> Result<u64> {
+        let value = self.eval(page, mask_js(opts)).await?;
+        value
+            .as_u64()
+            .ok_or_else(|| anyhow!("expected a mask count from page"))
     }
 
     pub async fn close(mut self) {
@@ -1006,6 +1070,106 @@ fn interaction_js(step: &InteractionStep, index: usize, budget_ms: u64) -> Strin
     }
 }
 
+/// Cover masked elements with ink (or blur) and wrap sensitive-data matches in
+/// covered spans. Explicit selectors cover every match; enabled patterns scan
+/// text nodes and form values. Returns the number of boxes drawn.
+fn mask_js(opts: &Opts) -> String {
+    let selectors = serde_json::to_string(&opts.masks).expect("masks are serializable");
+    let blur = match opts.mask_blur_px {
+        Some(px) => px.to_string(),
+        None => "null".into(),
+    };
+    let patterns: Vec<serde_json::Value> = opts
+        .mask_patterns
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name(),
+                "source": p.regex_source(),
+            })
+        })
+        .collect();
+    let patterns = serde_json::to_string(&patterns).expect("patterns are serializable");
+    format!(
+        r##"(() => {{
+  const selectors = {selectors};
+  const blurPx = {blur};
+  const patterns = {patterns};
+  let count = 0;
+  const cover = (x, y, w, h) => {{
+    if (!(w > 0 && h > 0) || ![x, y, w, h].every(Number.isFinite)) return;
+    const veil = document.createElement("div");
+    veil.dataset.iris = "mask";
+    let css = "position:absolute;left:" + x + "px;top:" + y + "px;"
+      + "width:" + w + "px;height:" + h + "px;z-index:2147483645;"
+      + "pointer-events:none;margin:0;padding:0;";
+    if (blurPx === null) css += "background:#111310;";
+    else css += "background:rgba(17,19,16,.15);backdrop-filter:blur(" + blurPx + "px);"
+      + "-webkit-backdrop-filter:blur(" + blurPx + "px);";
+    veil.style.cssText = css;
+    document.body.appendChild(veil);
+    count++;
+  }};
+  const box = (rect) => cover(
+    rect.left + window.scrollX, rect.top + window.scrollY, rect.width, rect.height,
+  );
+  for (const selector of selectors) {{
+    let nodes;
+    try {{ nodes = Array.from(document.querySelectorAll(selector)); }}
+    catch {{ throw new Error("invalid selector: " + selector); }}
+    for (const el of nodes) box(el.getBoundingClientRect());
+  }}
+  if (patterns.length > 0) {{
+    const matchers = patterns.map(p => new RegExp(p.source, "g"));
+    const skipped = (node) => {{
+      const el = node.parentElement;
+      return !el || el.closest("script,style,noscript,[data-iris]");
+    }};
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const byNode = new Map();
+    while (walker.nextNode()) {{
+      const node = walker.currentNode;
+      if (skipped(node)) continue;
+      for (const rx of matchers) {{
+        rx.lastIndex = 0;
+        let m;
+        while ((m = rx.exec(node.data))) {{
+          if (m[0].length === 0) {{ rx.lastIndex++; continue; }}
+          if (!byNode.has(node)) byNode.set(node, []);
+          byNode.get(node).push([m.index, m.index + m[0].length]);
+        }}
+      }}
+    }}
+    // Back-to-front per node so earlier offsets survive each split.
+    for (const [node, ranges] of byNode) {{
+      if (!node.isConnected) continue;
+      ranges.sort((a, b) => b[0] - a[0]);
+      for (const [start, end] of ranges) {{
+        if (start < 0 || end > node.data.length || start >= end) continue;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, end);
+        const span = document.createElement("span");
+        span.dataset.iris = "redact";
+        try {{ range.surroundContents(span); }} catch {{ continue; }}
+      }}
+    }}
+    for (const span of document.querySelectorAll('span[data-iris="redact"]')) {{
+      box(span.getBoundingClientRect());
+    }}
+    // Form values are not text nodes: cover whole inputs whose value matches.
+    const testers = matchers.map(rx => new RegExp(rx.source, ""));
+    for (const el of document.querySelectorAll("input,textarea")) {{
+      const value = el.value || "";
+      if (!value) continue;
+      if (testers.some(rx => rx.test(value))) box(el.getBoundingClientRect());
+    }}
+  }}
+  return count;
+}})()"##
+    )
+}
+
 /// Draw numbered markers, labels, outlines, and dimming as in-page DOM nodes.
 /// Returns every overlay box in document coordinates so element clips can grow
 /// to include them. Labels auto-place: prefer the right of the target, fall
@@ -1372,6 +1536,68 @@ mod tests {
     }
 
     #[test]
+    fn mask_patterns_have_expected_names_and_sources() {
+        assert_eq!(
+            [
+                MaskPattern::Email,
+                MaskPattern::Phone,
+                MaskPattern::Ssn,
+                MaskPattern::Account,
+            ]
+            .map(MaskPattern::name),
+            ["email", "phone", "ssn", "account"]
+        );
+        // Sources must survive a JSON round trip into `new RegExp(source)`.
+        for pattern in [
+            MaskPattern::Email,
+            MaskPattern::Phone,
+            MaskPattern::Ssn,
+            MaskPattern::Account,
+        ] {
+            let value = serde_json::to_string(pattern.regex_source()).unwrap();
+            let back: String = serde_json::from_str(&value).unwrap();
+            assert_eq!(back, pattern.regex_source());
+        }
+    }
+
+    #[test]
+    fn mask_script_embeds_selectors_blur_and_patterns() {
+        let opts = Opts {
+            viewport: Viewport::desktop(),
+            mode: CaptureMode::Viewport,
+            dark: false,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(3),
+            format: Format::Png,
+            annotations: Vec::new(),
+            highlights: Vec::new(),
+            dim: false,
+            steps: Vec::new(),
+            masks: vec![".client-name".into(), "[data-private]".into()],
+            mask_blur_px: Some(6),
+            mask_patterns: vec![MaskPattern::Email, MaskPattern::Ssn],
+        };
+        let js = mask_js(&opts);
+        assert!(js.contains(r#"const selectors = [".client-name","[data-private]"]"#));
+        assert!(js.contains("const blurPx = 6;"));
+        assert!(js.contains(r#""name":"email""#));
+        assert!(js.contains(r#""name":"ssn""#));
+        assert!(!js.contains(r#""name":"phone""#));
+        assert!(js.contains("backdrop-filter:blur("));
+
+        let ink = Opts {
+            masks: vec![".x".into()],
+            mask_blur_px: None,
+            mask_patterns: Vec::new(),
+            ..default_opts()
+        };
+        let js = mask_js(&ink);
+        assert!(js.contains("const blurPx = null;"));
+        assert!(js.contains("background:#111310;"));
+    }
+
+    #[test]
     fn overlay_script_embeds_points_with_json_escaping() {
         let opts = Opts {
             viewport: Viewport::desktop(),
@@ -1389,6 +1615,9 @@ mod tests {
             highlights: vec!["#run-analysis".into()],
             dim: true,
             steps: Vec::new(),
+            masks: Vec::new(),
+            mask_blur_px: None,
+            mask_patterns: Vec::new(),
         };
         let js = overlay_js(&opts);
         assert!(js.contains(
@@ -1670,6 +1899,142 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn browser_masking_contract() -> Result<()> {
+        let temp = std::env::temp_dir().join(format!("iris-mask-{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp).await?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/private.html")
+            .canonicalize()?;
+        let url = url::Url::from_file_path(&fixture)
+            .map_err(|_| anyhow!("fixture path is not a file URL"))?;
+        let viewport = Viewport {
+            width: 480,
+            height: 360,
+            scale: 1.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+
+        let plain = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::Viewport, false),
+            )
+            .await?;
+
+        // Two explicit selectors plus email, phone, SSN, card, and the email
+        // inside the input value: seven redaction boxes in total.
+        let masked_path = temp.join("masked.png");
+        let masked_image = session
+            .capture(
+                url.as_str(),
+                &mask_opts(
+                    viewport,
+                    vec![".client-name".into(), "[data-private]".into()],
+                    None,
+                    vec![
+                        MaskPattern::Email,
+                        MaskPattern::Phone,
+                        MaskPattern::Ssn,
+                        MaskPattern::Account,
+                    ],
+                ),
+            )
+            .await?;
+        masked_image.write_to(&masked_path).await?;
+        assert_eq!(masked_image.shot.masked, 7);
+        // Redaction visibly changes pixels; the order number and surrounding
+        // prose keep the shot recognizable as the same page.
+        assert_ne!(masked_image.data, plain.data);
+
+        // Blur mode draws the same boxes through backdrop-filter instead.
+        let blurred = session
+            .capture(
+                url.as_str(),
+                &mask_opts(viewport, vec![".client-name".into()], Some(6), vec![]),
+            )
+            .await?;
+        assert_eq!(blurred.shot.masked, 1);
+        assert_ne!(blurred.data, plain.data);
+
+        // Patterns alone leave the order number and prose untouched in shape:
+        // only the five sensitive matches are covered.
+        let patterns_only = session
+            .capture(
+                url.as_str(),
+                &mask_opts(
+                    viewport,
+                    vec![],
+                    None,
+                    vec![
+                        MaskPattern::Email,
+                        MaskPattern::Phone,
+                        MaskPattern::Ssn,
+                        MaskPattern::Account,
+                    ],
+                ),
+            )
+            .await?;
+        assert_eq!(patterns_only.shot.masked, 5);
+
+        let invalid = session
+            .capture(
+                url.as_str(),
+                &mask_opts(viewport, vec!["[".into()], None, vec![]),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{invalid:#}").contains("invalid selector: ["));
+
+        session.close().await;
+        tokio::fs::remove_dir_all(temp).await?;
+        Ok(())
+    }
+
+    fn default_opts() -> Opts {
+        Opts {
+            viewport: Viewport::desktop(),
+            mode: CaptureMode::Viewport,
+            dark: false,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(3),
+            format: Format::Png,
+            annotations: Vec::new(),
+            highlights: Vec::new(),
+            dim: false,
+            steps: Vec::new(),
+            masks: Vec::new(),
+            mask_blur_px: None,
+            mask_patterns: Vec::new(),
+        }
+    }
+
+    fn mask_opts(
+        viewport: Viewport,
+        masks: Vec<String>,
+        mask_blur_px: Option<u32>,
+        mask_patterns: Vec<MaskPattern>,
+    ) -> Opts {
+        Opts {
+            viewport,
+            mode: CaptureMode::Viewport,
+            dark: false,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(4),
+            format: Format::Png,
+            annotations: Vec::new(),
+            highlights: Vec::new(),
+            dim: false,
+            steps: Vec::new(),
+            masks,
+            mask_blur_px,
+            mask_patterns,
+        }
+    }
+
     fn step_opts(viewport: Viewport, steps: Vec<InteractionStep>, mode: CaptureMode) -> Opts {
         Opts {
             viewport,
@@ -1683,6 +2048,9 @@ mod tests {
             highlights: Vec::new(),
             dim: false,
             steps,
+            masks: Vec::new(),
+            mask_blur_px: None,
+            mask_patterns: Vec::new(),
         }
     }
 
@@ -1702,6 +2070,9 @@ mod tests {
             highlights: Vec::new(),
             dim: false,
             steps: Vec::new(),
+            masks: Vec::new(),
+            mask_blur_px: None,
+            mask_patterns: Vec::new(),
         }
     }
 
@@ -1718,6 +2089,9 @@ mod tests {
             highlights: Vec::new(),
             dim: false,
             steps: Vec::new(),
+            masks: Vec::new(),
+            mask_blur_px: None,
+            mask_patterns: Vec::new(),
         }
     }
 
