@@ -38,10 +38,27 @@ struct Cli {
     capture: CaptureArgs,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Serve Iris as a local Model Context Protocol camera
     Mcp(mcp::McpArgs),
+    /// Save a signed-in browser session for later reuse
+    Login(LoginArgs),
+}
+
+#[derive(Debug, Args)]
+struct LoginArgs {
+    /// Session name to save
+    #[arg(long, value_name = "NAME")]
+    session: String,
+
+    /// URL to open for sign-in
+    #[arg(value_name = "URL")]
+    url: String,
+
+    /// Chrome/Chromium binary [auto-detected]
+    #[arg(long, env = "CHROME", value_name = "PATH")]
+    chrome: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -153,6 +170,10 @@ struct CaptureArgs {
     #[arg(long, env = "CHROME", value_name = "PATH")]
     chrome: Option<PathBuf>,
 
+    /// Capture with a saved session (`iris login --session NAME <url>`)
+    #[arg(long, value_name = "NAME")]
+    session: Option<String>,
+
     /// Emit one JSON object per completed capture
     #[arg(long)]
     json: bool,
@@ -161,10 +182,28 @@ struct CaptureArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Mcp(args)) = cli.command {
-        return mcp::run(args).await;
+    match cli.command {
+        Some(Command::Mcp(args)) => mcp::run(args).await,
+        Some(Command::Login(args)) => run_login(args).await,
+        None => run_capture(cli.capture).await,
     }
-    run_capture(cli.capture).await
+}
+
+/// Open a visible browser at `url` so the user can sign in, then keep the
+/// profile on disk for later `--session` captures.
+async fn run_login(args: LoginArgs) -> Result<()> {
+    let url = normalize_url(&args.url)?;
+    let name = args.session.trim().to_owned();
+    let dir = capture::session_dir(&name)?;
+    tokio::fs::create_dir_all(&dir).await?;
+    let session =
+        Session::launch_headed(args.chrome, capture::Viewport::desktop(), dir.clone()).await?;
+    println!("Signing in as session {name:?} at {url}.");
+    println!("Use the opened browser window to sign in, then press Enter here.");
+    session.login_and_wait(url.as_str()).await?;
+    session.close().await;
+    println!("Saved session {name:?} → {}", dir.display());
+    Ok(())
 }
 
 async fn run_capture(cli: CaptureArgs) -> Result<()> {
@@ -196,7 +235,12 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         mask_patterns: cli.mask_patterns,
     });
 
-    let session = Arc::new(Session::launch(cli.chrome, viewport).await?);
+    let session = if let Some(name) = cli.session.as_deref() {
+        let dir = capture::resolve_session_dir(name)?;
+        Arc::new(Session::launch_with_profile(cli.chrome, viewport, dir).await?)
+    } else {
+        Arc::new(Session::launch(cli.chrome, viewport).await?)
+    };
 
     let mut failed = 0usize;
     let mut stream = futures::stream::iter(targets)
@@ -494,6 +538,30 @@ mod tests {
 
         let viewport = Cli::try_parse_from(["iris", "example.com"]).unwrap();
         assert_eq!(capture_mode(&viewport.capture), CaptureMode::Viewport);
+    }
+
+    #[test]
+    fn login_subcommand_takes_a_session_and_a_url() {
+        let cli =
+            Cli::try_parse_from(["iris", "login", "--session", "matteros", "app.example.com"])
+                .unwrap();
+        match cli.command {
+            Some(Command::Login(args)) => {
+                assert_eq!(args.session, "matteros");
+                assert_eq!(args.url, "app.example.com");
+            }
+            other => panic!("expected login subcommand, got {other:?}"),
+        }
+
+        let missing_url = Cli::try_parse_from(["iris", "login", "--session", "matteros"])
+            .err()
+            .unwrap();
+        assert_eq!(missing_url.kind(), ErrorKind::MissingRequiredArgument);
+
+        let capture =
+            Cli::try_parse_from(["iris", "example.com", "--session", "matteros"]).unwrap();
+        assert_eq!(capture.capture.session.as_deref(), Some("matteros"));
+        assert!(capture.command.is_none());
     }
 
     #[test]

@@ -24,26 +24,99 @@ const IPHONE_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) 
      AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
 static PROFILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-struct ProfileDir(PathBuf);
+struct ProfileDir {
+    path: PathBuf,
+    persistent: bool,
+}
 
 impl ProfileDir {
     fn unique() -> Self {
-        Self(std::env::temp_dir().join(format!(
-            "iris-chrome-{}-{}",
-            std::process::id(),
-            PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        )))
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "iris-chrome-{}-{}",
+                std::process::id(),
+                PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            )),
+            persistent: false,
+        }
+    }
+
+    fn persistent(path: PathBuf) -> Self {
+        Self {
+            path,
+            persistent: true,
+        }
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for ProfileDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.persistent {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
+}
+
+/// Reject names that could escape the sessions directory or confuse shells.
+pub fn validate_session_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("session name must not be empty");
+    }
+    if name.len() > 64 {
+        bail!("session name is too long (max 64 characters)");
+    }
+    if name == "." || name == ".." {
+        bail!("invalid session name {name:?}");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("invalid session name {name:?}: use letters, digits, '-', '_' or '.'");
+    }
+    Ok(())
+}
+
+fn data_root() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library/Application Support/iris"));
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|base| base.join("iris"));
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .map(|base| base.join("iris"));
+    base.ok_or_else(|| anyhow!("cannot locate a data directory for sessions"))
+}
+
+/// Directory holding a named session's browser profile, creating nothing.
+pub fn session_dir(name: &str) -> Result<PathBuf> {
+    let name = name.trim();
+    validate_session_name(name)?;
+    Ok(data_root()?.join("sessions").join(name))
+}
+
+/// Resolve a session saved by `iris login`, erroring when it does not exist.
+pub fn resolve_session_dir(name: &str) -> Result<PathBuf> {
+    let dir = session_dir(name)?;
+    if !dir.is_dir() {
+        bail!(
+            "unknown session {:?}: save it first with `iris login --session {:?} <url>`",
+            name.trim(),
+            name.trim()
+        );
+    }
+    Ok(dir)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -424,10 +497,55 @@ pub struct Session {
 
 impl Session {
     pub async fn launch(chrome: Option<PathBuf>, viewport: Viewport) -> Result<Self> {
-        let profile_dir = ProfileDir::unique();
+        Self::start(chrome, viewport, ProfileDir::unique(), false).await
+    }
+
+    /// Launch against a named session's directory, keeping cookies and storage
+    /// on disk after close. The directory must already exist.
+    pub async fn launch_with_profile(
+        chrome: Option<PathBuf>,
+        viewport: Viewport,
+        dir: PathBuf,
+    ) -> Result<Self> {
+        Self::start(chrome, viewport, ProfileDir::persistent(dir), false).await
+    }
+
+    /// Launch a visible browser for `login_and_wait`: the user signs in by hand.
+    pub async fn launch_headed(
+        chrome: Option<PathBuf>,
+        viewport: Viewport,
+        dir: PathBuf,
+    ) -> Result<Self> {
+        Self::start(chrome, viewport, ProfileDir::persistent(dir), true).await
+    }
+
+    /// Open `url` and wait for the user to press Enter (or close stdin),
+    /// leaving the profile on disk for later `--session` captures.
+    pub async fn login_and_wait(&self, url: &str) -> Result<()> {
+        let page = self.browser.new_page(url).await?;
+        tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)
+        })
+        .await
+        .context("failed to wait for sign-in confirmation")?
+        .context("failed to read sign-in confirmation")?;
+        let _ = page.close().await;
+        Ok(())
+    }
+
+    async fn start(
+        chrome: Option<PathBuf>,
+        viewport: Viewport,
+        profile_dir: ProfileDir,
+        headed: bool,
+    ) -> Result<Self> {
         let mut config = BrowserConfig::builder()
             .window_size(viewport.width, viewport.height)
             .user_data_dir(profile_dir.path());
+        if headed {
+            config = config.with_head();
+        }
         if let Some(path) = chrome.or_else(find_chrome) {
             config = config.chrome_executable(path);
         }
@@ -736,7 +854,11 @@ impl Session {
             let _ = self.browser.kill().await;
         }
         self.handler.abort();
-        let _ = tokio::fs::remove_dir_all(self.profile_dir.path()).await;
+        // Named sessions keep their profile for later reuse; temp profiles
+        // are removed (the Drop impl covers abnormal exits too).
+        if !self.profile_dir.persistent {
+            let _ = tokio::fs::remove_dir_all(self.profile_dir.path()).await;
+        }
     }
 }
 
@@ -1660,6 +1782,39 @@ mod tests {
     }
 
     #[test]
+    fn session_names_reject_path_escapes_and_blank_values() {
+        for good in ["matteros", "va-matters_2", "v2.0"] {
+            validate_session_name(good).unwrap();
+        }
+        for bad in [
+            "",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+            "has space",
+            "semi;colon",
+            "üñï",
+        ] {
+            assert!(
+                validate_session_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(validate_session_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn session_dirs_stay_under_the_sessions_root() {
+        let dir = session_dir("  matteros  ").unwrap();
+        assert!(dir.ends_with(Path::new("sessions").join("matteros")));
+        assert!(session_dir("../evil").is_err());
+        let missing = resolve_session_dir("iris-test-no-such-session-xyz").unwrap_err();
+        assert!(format!("{missing:#}").contains("unknown session"));
+        assert!(format!("{missing:#}").contains("iris login"));
+    }
+
+    #[test]
     fn local_urls_use_http_and_public_hosts_use_https() {
         assert_eq!(
             normalize_url("localhost:3000").unwrap().as_str(),
@@ -2127,6 +2282,65 @@ mod tests {
         assert_eq!((system.shot.width, system.shot.height), (320, 240));
 
         session.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_session_contract() -> Result<()> {
+        let temp = std::env::temp_dir().join(format!("iris-session-{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp).await?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/session.html")
+            .canonicalize()?;
+        let url = url::Url::from_file_path(&fixture)
+            .map_err(|_| anyhow!("fixture path is not a file URL"))?;
+        let viewport = Viewport {
+            width: 480,
+            height: 360,
+            scale: 1.0,
+            mobile: false,
+        };
+        let profile = temp.join("profile");
+        tokio::fs::create_dir_all(&profile).await?;
+
+        // First visit in the named profile stores the flag but renders no
+        // #returning element yet.
+        let first = Session::launch_with_profile(None, viewport, profile.clone()).await?;
+        let seen = first
+            .capture(
+                url.as_str(),
+                &element_opts(viewport, "#always", 0, Format::Png),
+            )
+            .await?;
+        assert_eq!((seen.shot.width, seen.shot.height), (200, 40));
+        // Closing a named profile keeps it on disk for the next launch.
+        first.close().await;
+        assert!(profile.is_dir());
+
+        // Second launch with the same directory sees the stored flag.
+        let second = Session::launch_with_profile(None, viewport, profile.clone()).await?;
+        let back = second
+            .capture(
+                url.as_str(),
+                &element_opts(viewport, "#returning", 0, Format::Png),
+            )
+            .await?;
+        assert_eq!((back.shot.width, back.shot.height), (200, 40));
+        second.close().await;
+
+        // A fresh temp profile is isolated: the flag is absent there.
+        let fresh = Session::launch(None, viewport).await?;
+        let missing = fresh
+            .capture(
+                url.as_str(),
+                &element_opts(viewport, "#returning", 0, Format::Png),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{missing:#}").contains("selector never appeared: #returning"));
+        fresh.close().await;
+
+        tokio::fs::remove_dir_all(temp).await?;
         Ok(())
     }
 

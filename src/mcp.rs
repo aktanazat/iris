@@ -65,6 +65,8 @@ pub struct CaptureRequest {
     /// Dim the page outside annotated and highlighted elements.
     #[serde(default)]
     dim: bool,
+    /// Capture with a saved session (`iris login --session NAME <url>`).
+    session: Option<String>,
     /// Device scale factor overriding the viewport preset.
     scale: Option<f64>,
     /// Per-page timeout in seconds. Defaults to 30.
@@ -177,6 +179,7 @@ impl ImageFormat {
 struct PreparedCapture {
     url: url::Url,
     output: Option<PathBuf>,
+    session: Option<String>,
     opts: Opts,
 }
 
@@ -220,6 +223,17 @@ impl CaptureRequest {
             .filter(|selector| !selector.is_empty());
         if wait_for_supplied && wait_for.is_none() {
             bail!("wait_for must not be empty");
+        }
+        let session_supplied = self.session.is_some();
+        let session = self
+            .session
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+        if session_supplied && session.is_none() {
+            bail!("session must not be empty");
+        }
+        if let Some(name) = &session {
+            crate::capture::validate_session_name(name)?;
         }
 
         let annotations = self
@@ -340,6 +354,7 @@ impl CaptureRequest {
         Ok(PreparedCapture {
             url,
             output: self.output,
+            session,
             opts: Opts {
                 viewport,
                 mode,
@@ -362,61 +377,78 @@ impl CaptureRequest {
 
 struct McpState {
     chrome: Option<PathBuf>,
-    session: Mutex<Option<Arc<Session>>>,
+    sessions: Mutex<std::collections::HashMap<String, Arc<Session>>>,
     permits: Semaphore,
 }
+
+/// Cache key for the default temp-profile session.
+const DEFAULT_SESSION: &str = "";
 
 impl McpState {
     fn new(chrome: Option<PathBuf>) -> Self {
         Self {
             chrome,
-            session: Mutex::new(None),
+            sessions: Mutex::new(std::collections::HashMap::new()),
             permits: Semaphore::new(4),
         }
     }
 
-    async fn session(&self) -> Result<Arc<Session>> {
-        let mut session = self.session.lock().await;
-        if session
-            .as_ref()
+    async fn session(&self, name: Option<&str>) -> Result<Arc<Session>> {
+        let key = name.unwrap_or(DEFAULT_SESSION).to_owned();
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&key)
             .is_some_and(|session| !session.is_healthy())
         {
-            session.take();
+            sessions.remove(&key);
         }
-        if let Some(session) = session.as_ref() {
+        if let Some(session) = sessions.get(&key) {
             return Ok(Arc::clone(session));
         }
-        let launched = Arc::new(Session::launch(self.chrome.clone(), Viewport::desktop()).await?);
-        *session = Some(Arc::clone(&launched));
+        let launched = if key.is_empty() {
+            Arc::new(Session::launch(self.chrome.clone(), Viewport::desktop()).await?)
+        } else {
+            let dir = crate::capture::resolve_session_dir(&key)?;
+            Arc::new(
+                Session::launch_with_profile(self.chrome.clone(), Viewport::desktop(), dir).await?,
+            )
+        };
+        sessions.insert(key, Arc::clone(&launched));
         Ok(launched)
     }
 
-    async fn capture(&self, url: &str, opts: &Opts) -> Result<CapturedImage> {
+    async fn capture(
+        &self,
+        session_name: Option<&str>,
+        url: &str,
+        opts: &Opts,
+    ) -> Result<CapturedImage> {
         let _permit = self
             .permits
             .acquire()
             .await
             .map_err(|_| anyhow!("capture queue closed"))?;
-        let session = self.session().await?;
+        let session = self.session(session_name).await?;
         let result = session.capture(url, opts).await;
         if result.is_err() && !session.is_healthy() {
-            let mut current = self.session.lock().await;
+            let mut current = self.sessions.lock().await;
+            let key = session_name.unwrap_or(DEFAULT_SESSION);
             if current
-                .as_ref()
+                .get(key)
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &session))
             {
-                current.take();
+                current.remove(key);
             }
         }
         result
     }
 
     async fn close(&self) {
-        let session = self.session.lock().await.take();
-        if let Some(session) = session
-            && let Ok(session) = Arc::try_unwrap(session)
-        {
-            session.close().await;
+        let sessions = std::mem::take(&mut *self.sessions.lock().await);
+        for (_, session) in sessions {
+            if let Ok(session) = Arc::try_unwrap(session) {
+                session.close().await;
+            }
         }
     }
 }
@@ -443,7 +475,11 @@ impl IrisServer {
 
         let image = match self
             .state
-            .capture(prepared.url.as_str(), &prepared.opts)
+            .capture(
+                prepared.session.as_deref(),
+                prepared.url.as_str(),
+                &prepared.opts,
+            )
             .await
         {
             Ok(image) => image,
@@ -608,6 +644,7 @@ mod tests {
             scale: None,
             timeout_seconds: None,
             color_scheme: None,
+            session: None,
             output: None,
             annotations: None,
             highlight: None,
@@ -831,6 +868,38 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("dark conflicts with color_scheme")
+        );
+    }
+
+    #[test]
+    fn session_requests_are_trimmed_and_validated() {
+        let plain = request("example.com").prepare().unwrap();
+        assert_eq!(plain.session, None);
+
+        let mut named = request("example.com");
+        named.session = Some(" matteros ".into());
+        assert_eq!(
+            named.prepare().unwrap().session.as_deref(),
+            Some("matteros")
+        );
+
+        let mut empty = request("example.com");
+        empty.session = Some("  ".into());
+        assert!(
+            empty
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("session must not be empty")
+        );
+
+        let mut evil = request("example.com");
+        evil.session = Some("../evil".into());
+        assert!(
+            evil.prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid session name")
         );
     }
 
