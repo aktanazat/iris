@@ -70,9 +70,17 @@ struct CaptureArgs {
     #[arg(long, value_name = "PX", requires = "selector")]
     padding: Option<u32>,
 
-    /// Emulate prefers-color-scheme: dark
-    #[arg(long)]
+    /// Emulate prefers-color-scheme: dark (same as --color-scheme dark)
+    #[arg(long, conflicts_with = "light", conflicts_with = "color_scheme")]
     dark: bool,
+
+    /// Emulate prefers-color-scheme: light (same as --color-scheme light)
+    #[arg(long, conflicts_with = "dark", conflicts_with = "color_scheme")]
+    light: bool,
+
+    /// Force a color scheme: light, dark, or system [default: system]
+    #[arg(long, value_name = "SCHEME")]
+    color_scheme: Option<capture::ColorScheme>,
 
     /// Image format (a recognized --out file extension wins) [default: png]
     #[arg(long, value_parser = ["png", "jpg", "jpeg", "webp"], value_name = "FMT")]
@@ -170,10 +178,11 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
     let annotations = build_annotations(&cli.point);
 
     let steps = build_steps(&cli);
+    let color_scheme = resolve_color_scheme(&cli);
     let opts = Arc::new(Opts {
         viewport,
         mode: mode.clone(),
-        dark: cli.dark,
+        color_scheme,
         wait_ms: cli.wait,
         wait_for: cli.wait_for,
         timeout: Duration::from_secs(cli.timeout.max(1)),
@@ -221,6 +230,7 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
                             format,
                             &shot,
                             opts.annotations.len(),
+                            opts.color_scheme,
                         ))?
                     );
                 } else {
@@ -310,6 +320,22 @@ fn build_steps(cli: &CaptureArgs) -> Vec<capture::InteractionStep> {
             .map(|key| capture::InteractionStep::Press { key: key.clone() }),
     );
     steps
+}
+
+/// Resolve the effective color scheme. `--color-scheme` wins when present;
+/// otherwise the `--dark` / `--light` shorthands apply; default is system
+/// (no override, preserving historical output). Clap conflicts keep shorthand
+/// and explicit flags from combining.
+fn resolve_color_scheme(cli: &CaptureArgs) -> capture::ColorScheme {
+    if let Some(scheme) = cli.color_scheme {
+        scheme
+    } else if cli.dark {
+        capture::ColorScheme::Dark
+    } else if cli.light {
+        capture::ColorScheme::Light
+    } else {
+        capture::ColorScheme::System
+    }
 }
 
 fn capture_mode(cli: &CaptureArgs) -> CaptureMode {
@@ -609,6 +635,50 @@ mod tests {
     }
 
     #[test]
+    fn color_scheme_resolution_prefers_explicit_and_defaults_to_system() {
+        let plain = Cli::try_parse_from(["iris", "example.com"]).unwrap();
+        assert_eq!(
+            resolve_color_scheme(&plain.capture),
+            capture::ColorScheme::System
+        );
+
+        let dark = Cli::try_parse_from(["iris", "example.com", "--dark"]).unwrap();
+        assert_eq!(
+            resolve_color_scheme(&dark.capture),
+            capture::ColorScheme::Dark
+        );
+
+        let light = Cli::try_parse_from(["iris", "example.com", "--light"]).unwrap();
+        assert_eq!(
+            resolve_color_scheme(&light.capture),
+            capture::ColorScheme::Light
+        );
+
+        let explicit =
+            Cli::try_parse_from(["iris", "example.com", "--color-scheme", "dark"]).unwrap();
+        assert_eq!(
+            resolve_color_scheme(&explicit.capture),
+            capture::ColorScheme::Dark
+        );
+
+        let clash = Cli::try_parse_from(["iris", "example.com", "--dark", "--light"])
+            .err()
+            .unwrap();
+        assert_eq!(clash.kind(), ErrorKind::ArgumentConflict);
+
+        let mixed =
+            Cli::try_parse_from(["iris", "example.com", "--dark", "--color-scheme", "light"])
+                .err()
+                .unwrap();
+        assert_eq!(mixed.kind(), ErrorKind::ArgumentConflict);
+
+        let bad = Cli::try_parse_from(["iris", "example.com", "--color-scheme", "sepia"])
+            .err()
+            .unwrap();
+        assert_eq!(bad.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn json_reports_have_stable_typed_fields() {
         let mode = CaptureMode::Element {
             selector: "h1".into(),
@@ -628,11 +698,12 @@ mod tests {
             Format::Png,
             &shot,
             0,
+            capture::ColorScheme::System,
         ))
         .unwrap();
         assert_eq!(
             success,
-            r#"{"status":"ok","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}"#
+            r#"{"status":"ok","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231,"color_scheme":"system"}"#
         );
 
         let annotated = serde_json::to_string(&success_report(
@@ -642,9 +713,10 @@ mod tests {
             Format::Png,
             &shot,
             2,
+            capture::ColorScheme::Dark,
         ))
         .unwrap();
-        assert!(annotated.ends_with(r#""bytes":14231,"annotations":2}"#));
+        assert!(annotated.ends_with(r#""color_scheme":"dark","annotations":2}"#));
 
         let failure = serde_json::to_string(&capture::error_report(
             "https://example.com/",

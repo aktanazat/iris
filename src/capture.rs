@@ -147,11 +147,40 @@ pub struct Annotation {
     pub number: u32,
 }
 
+/// Forced `prefers-color-scheme` emulation. `System` applies no override and
+/// preserves historical output; `Light`/`Dark` force the scheme explicitly so
+/// output never depends on the machine's OS theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorScheme {
+    Light,
+    Dark,
+    System,
+}
+
+impl ColorScheme {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::System => "system",
+        }
+    }
+
+    fn css_value(self) -> Option<&'static str> {
+        match self {
+            Self::Light => Some("light"),
+            Self::Dark => Some("dark"),
+            Self::System => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Opts {
     pub viewport: Viewport,
     pub mode: CaptureMode,
-    pub dark: bool,
+    pub color_scheme: ColorScheme,
     pub wait_ms: u64,
     pub wait_for: Option<String>,
     pub timeout: Duration,
@@ -274,6 +303,7 @@ pub struct SuccessReport {
     scale: f64,
     format: &'static str,
     bytes: u64,
+    color_scheme: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,6 +331,7 @@ pub fn success_report(
     format: Format,
     shot: &Shot,
     annotations: usize,
+    color_scheme: ColorScheme,
 ) -> SuccessReport {
     SuccessReport {
         status: "ok",
@@ -314,6 +345,7 @@ pub fn success_report(
         scale: shot.scale,
         format: format.ext(),
         bytes: shot.bytes,
+        color_scheme: color_scheme.name(),
         annotations: (annotations > 0).then_some(annotations),
         masked: (shot.masked > 0).then_some(shot.masked),
     }
@@ -472,12 +504,12 @@ impl Session {
             .await?;
         }
 
-        if opts.dark {
+        if let Some(value) = opts.color_scheme.css_value() {
             page.execute(
                 SetEmulatedMediaParams::builder()
                     .feature(MediaFeature {
                         name: "prefers-color-scheme".into(),
-                        value: "dark".into(),
+                        value: value.into(),
                     })
                     .build(),
             )
@@ -1565,7 +1597,7 @@ mod tests {
         let opts = Opts {
             viewport: Viewport::desktop(),
             mode: CaptureMode::Viewport,
-            dark: false,
+            color_scheme: ColorScheme::System,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(3),
@@ -1602,7 +1634,7 @@ mod tests {
         let opts = Opts {
             viewport: Viewport::desktop(),
             mode: CaptureMode::Viewport,
-            dark: false,
+            color_scheme: ColorScheme::System,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(3),
@@ -1737,7 +1769,7 @@ mod tests {
         let dark_viewport = session
             .capture(
                 url.as_str(),
-                &page_opts(viewport, CaptureMode::Viewport, true),
+                &page_opts(viewport, CaptureMode::Viewport, ColorScheme::Dark),
             )
             .await?;
         assert_eq!(
@@ -1749,7 +1781,7 @@ mod tests {
         let full_page = session
             .capture(
                 url.as_str(),
-                &page_opts(viewport, CaptureMode::FullPage, false),
+                &page_opts(viewport, CaptureMode::FullPage, ColorScheme::System),
             )
             .await?;
         assert_eq!(full_page.shot.width, 320);
@@ -1768,7 +1800,7 @@ mod tests {
         let mobile = session
             .capture(
                 url.as_str(),
-                &page_opts(phone, CaptureMode::Viewport, false),
+                &page_opts(phone, CaptureMode::Viewport, ColorScheme::System),
             )
             .await?;
         assert_eq!((mobile.shot.width, mobile.shot.height), (390, 844));
@@ -1919,7 +1951,7 @@ mod tests {
         let plain = session
             .capture(
                 url.as_str(),
-                &page_opts(viewport, CaptureMode::Viewport, false),
+                &page_opts(viewport, CaptureMode::Viewport, ColorScheme::System),
             )
             .await?;
 
@@ -1996,7 +2028,7 @@ mod tests {
         Opts {
             viewport: Viewport::desktop(),
             mode: CaptureMode::Viewport,
-            dark: false,
+            color_scheme: ColorScheme::System,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(3),
@@ -2020,7 +2052,7 @@ mod tests {
         Opts {
             viewport,
             mode: CaptureMode::Viewport,
-            dark: false,
+            color_scheme: ColorScheme::System,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(4),
@@ -2039,7 +2071,7 @@ mod tests {
         Opts {
             viewport,
             mode,
-            dark: false,
+            color_scheme: ColorScheme::System,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(4),
@@ -2054,6 +2086,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn browser_color_scheme_contract() -> Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/precise-capture.html")
+            .canonicalize()?;
+        let url = url::Url::from_file_path(&fixture)
+            .map_err(|_| anyhow!("fixture path is not a file URL"))?;
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 1.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+
+        // The fixture swaps its background under prefers-color-scheme, so
+        // forced light and dark captures must render different pixels.
+        let light = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::Viewport, ColorScheme::Light),
+            )
+            .await?;
+        let dark = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::Viewport, ColorScheme::Dark),
+            )
+            .await?;
+        assert_eq!((light.shot.width, light.shot.height), (320, 240));
+        assert_ne!(light.data, dark.data);
+
+        let system = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::Viewport, ColorScheme::System),
+            )
+            .await?;
+        assert_eq!((system.shot.width, system.shot.height), (320, 240));
+
+        session.close().await;
+        Ok(())
+    }
+
     fn element_opts(viewport: Viewport, selector: &str, padding: u32, format: Format) -> Opts {
         Opts {
             viewport,
@@ -2061,7 +2137,7 @@ mod tests {
                 selector: selector.into(),
                 padding,
             },
-            dark: false,
+            color_scheme: ColorScheme::System,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(3),
@@ -2076,11 +2152,11 @@ mod tests {
         }
     }
 
-    fn page_opts(viewport: Viewport, mode: CaptureMode, dark: bool) -> Opts {
+    fn page_opts(viewport: Viewport, mode: CaptureMode, color_scheme: ColorScheme) -> Opts {
         Opts {
             viewport,
             mode,
-            dark,
+            color_scheme,
             wait_ms: 0,
             wait_for: None,
             timeout: Duration::from_secs(5),

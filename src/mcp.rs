@@ -38,9 +38,11 @@ pub struct CaptureRequest {
     full_page: bool,
     /// Viewport as WxH or desktop, iphone, or ipad. Defaults to desktop.
     size: Option<String>,
-    /// Emulate prefers-color-scheme: dark.
+    /// Emulate prefers-color-scheme: dark (shorthand for color_scheme dark).
     #[serde(default)]
     dark: bool,
+    /// Force a color scheme: light, dark, or system. Defaults to system.
+    color_scheme: Option<ColorSchemeRequest>,
     /// Image format. Defaults to png; a recognized output extension wins.
     format: Option<ImageFormat>,
     /// Extra settle delay in milliseconds after smart waiting.
@@ -77,6 +79,26 @@ pub struct AnnotationRequest {
     selector: String,
     /// Short label shown beside the marker.
     label: String,
+}
+
+/// Forced color scheme. `system` applies no override; `dark: true` stays as a
+/// back-compat shorthand for `dark` and conflicts with this field.
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorSchemeRequest {
+    Light,
+    Dark,
+    System,
+}
+
+impl ColorSchemeRequest {
+    fn capture_scheme(self) -> crate::capture::ColorScheme {
+        match self {
+            Self::Light => crate::capture::ColorScheme::Light,
+            Self::Dark => crate::capture::ColorScheme::Dark,
+            Self::System => crate::capture::ColorScheme::System,
+        }
+    }
 }
 
 /// Opt-in sensitive-data detector for masking.
@@ -308,13 +330,20 @@ impl CaptureRequest {
                 .ok_or_else(|| anyhow!("unsupported output extension: .{extension}"))?;
         }
 
+        let color_scheme = match (self.color_scheme, self.dark) {
+            (Some(scheme), false) => scheme.capture_scheme(),
+            (Some(_), true) => bail!("dark conflicts with color_scheme"),
+            (None, true) => crate::capture::ColorScheme::Dark,
+            (None, false) => crate::capture::ColorScheme::System,
+        };
+
         Ok(PreparedCapture {
             url,
             output: self.output,
             opts: Opts {
                 viewport,
                 mode,
-                dark: self.dark,
+                color_scheme,
                 wait_ms: self.wait_ms,
                 wait_for,
                 timeout: Duration::from_secs(timeout_seconds),
@@ -435,6 +464,7 @@ impl IrisServer {
             prepared.opts.format,
             &image.shot,
             prepared.opts.annotations.len(),
+            prepared.opts.color_scheme,
         );
         let structured = match serde_json::to_value(&report) {
             Ok(structured) => structured,
@@ -577,6 +607,7 @@ mod tests {
             wait_for: None,
             scale: None,
             timeout_seconds: None,
+            color_scheme: None,
             output: None,
             annotations: None,
             highlight: None,
@@ -770,6 +801,37 @@ mod tests {
             "redact_patterns": ["passport"],
         }));
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn color_scheme_requests_map_with_dark_back_compat() {
+        let plain = request("example.com").prepare().unwrap();
+        assert_eq!(plain.opts.color_scheme, crate::capture::ColorScheme::System);
+
+        let mut dark = request("example.com");
+        dark.dark = true;
+        assert_eq!(
+            dark.prepare().unwrap().opts.color_scheme,
+            crate::capture::ColorScheme::Dark
+        );
+
+        let mut light = request("example.com");
+        light.color_scheme = Some(ColorSchemeRequest::Light);
+        assert_eq!(
+            light.prepare().unwrap().opts.color_scheme,
+            crate::capture::ColorScheme::Light
+        );
+
+        let mut clash = request("example.com");
+        clash.dark = true;
+        clash.color_scheme = Some(ColorSchemeRequest::Light);
+        assert!(
+            clash
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("dark conflicts with color_scheme")
+        );
     }
 
     #[test]
