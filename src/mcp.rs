@@ -48,12 +48,27 @@ pub struct CaptureRequest {
     wait_ms: u64,
     /// Wait until this CSS selector exists before capturing.
     wait_for: Option<String>,
+    /// Numbered markers with labels pointing at elements, in list order.
+    annotations: Option<Vec<AnnotationRequest>>,
+    /// Outline the first element matching each CSS selector.
+    highlight: Option<Vec<String>>,
+    /// Dim the page outside annotated and highlighted elements.
+    #[serde(default)]
+    dim: bool,
     /// Device scale factor overriding the viewport preset.
     scale: Option<f64>,
     /// Per-page timeout in seconds. Defaults to 30.
     timeout_seconds: Option<u64>,
     /// Optional image path. Relative paths resolve from the MCP server working directory.
     output: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnnotationRequest {
+    /// CSS selector of the element to point at (first match wins).
+    selector: String,
+    /// Short label shown beside the marker.
+    label: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
@@ -124,6 +139,41 @@ impl CaptureRequest {
             bail!("wait_for must not be empty");
         }
 
+        let annotations = self
+            .annotations
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, point)| {
+                let selector = point.selector.trim().to_owned();
+                let label = point.label.trim().to_owned();
+                if selector.is_empty() {
+                    bail!("annotations[{i}].selector must not be empty");
+                }
+                if label.is_empty() {
+                    bail!("annotations[{i}].label must not be empty");
+                }
+                Ok(crate::capture::Annotation {
+                    selector,
+                    label,
+                    number: i as u32 + 1,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let highlights = self
+            .highlight
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, selector)| {
+                let selector = selector.trim().to_owned();
+                if selector.is_empty() {
+                    bail!("highlight[{i}] must not be empty");
+                }
+                Ok(selector)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut format = self
             .format
             .map(ImageFormat::capture_format)
@@ -148,6 +198,9 @@ impl CaptureRequest {
                 wait_for,
                 timeout: Duration::from_secs(timeout_seconds),
                 format,
+                annotations,
+                highlights,
+                dim: self.dim,
             },
         })
     }
@@ -256,6 +309,7 @@ impl IrisServer {
             &prepared.opts.mode,
             prepared.opts.format,
             &image.shot,
+            prepared.opts.annotations.len(),
         );
         let structured = match serde_json::to_value(&report) {
             Ok(structured) => structured,
@@ -399,6 +453,9 @@ mod tests {
             scale: None,
             timeout_seconds: None,
             output: None,
+            annotations: None,
+            highlight: None,
+            dim: false,
         }
     }
 
@@ -430,6 +487,64 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("padding requires selector")
+        );
+    }
+
+    #[test]
+    fn annotation_requests_are_numbered_and_validated() {
+        let mut capture = request("example.com");
+        capture.annotations = Some(vec![
+            AnnotationRequest {
+                selector: " #search ".into(),
+                label: " Find ".into(),
+            },
+            AnnotationRequest {
+                selector: "#run-analysis".into(),
+                label: "Run".into(),
+            },
+        ]);
+        capture.highlight = Some(vec![" #hero ".into()]);
+        capture.dim = true;
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(
+            prepared.opts.annotations,
+            vec![
+                crate::capture::Annotation {
+                    selector: "#search".into(),
+                    label: "Find".into(),
+                    number: 1,
+                },
+                crate::capture::Annotation {
+                    selector: "#run-analysis".into(),
+                    label: "Run".into(),
+                    number: 2,
+                },
+            ]
+        );
+        assert_eq!(prepared.opts.highlights, vec!["#hero"]);
+        assert!(prepared.opts.dim);
+
+        let mut empty_label = request("example.com");
+        empty_label.annotations = Some(vec![AnnotationRequest {
+            selector: "#search".into(),
+            label: "  ".into(),
+        }]);
+        assert!(
+            empty_label
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("annotations[0].label must not be empty")
+        );
+
+        let mut empty_highlight = request("example.com");
+        empty_highlight.highlight = Some(vec!["  ".into()]);
+        assert!(
+            empty_highlight
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("highlight[0] must not be empty")
         );
     }
 

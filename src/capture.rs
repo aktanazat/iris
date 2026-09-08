@@ -138,6 +138,15 @@ impl CaptureMode {
     }
 }
 
+/// One numbered marker + label pointing at the first element matching `selector`.
+/// Numbering follows flag order; labels are auto-placed to avoid covering the target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Annotation {
+    pub selector: String,
+    pub label: String,
+    pub number: u32,
+}
+
 #[derive(Debug)]
 pub struct Opts {
     pub viewport: Viewport,
@@ -147,6 +156,25 @@ pub struct Opts {
     pub wait_for: Option<String>,
     pub timeout: Duration,
     pub format: Format,
+    pub annotations: Vec<Annotation>,
+    pub highlights: Vec<String>,
+    pub dim: bool,
+}
+
+impl Opts {
+    pub fn overlays_enabled(&self) -> bool {
+        !self.annotations.is_empty() || !self.highlights.is_empty() || self.dim
+    }
+}
+
+/// One overlay box in document coordinates, returned by the in-page overlay
+/// script so element clips can grow to include nearby markers and labels.
+#[derive(Debug, Deserialize)]
+struct OverlayBox {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 #[derive(Debug)]
@@ -176,6 +204,8 @@ pub struct SuccessReport {
     scale: f64,
     format: &'static str,
     bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,6 +228,7 @@ pub fn success_report(
     mode: &CaptureMode,
     format: Format,
     shot: &Shot,
+    annotations: usize,
 ) -> SuccessReport {
     SuccessReport {
         status: "ok",
@@ -211,6 +242,7 @@ pub fn success_report(
         scale: shot.scale,
         format: format.ext(),
         bytes: shot.bytes,
+        annotations: (annotations > 0).then_some(annotations),
     }
 }
 
@@ -418,6 +450,14 @@ impl Session {
             self.eval(page, SETTLE_JS.into()).await?;
         }
 
+        // Overlays are plain DOM nodes drawn after the last settle so markers sit
+        // on final layout. The tab closes after capture, so no cleanup is needed.
+        let overlay_boxes = if opts.overlays_enabled() {
+            self.apply_overlays(page, opts).await?
+        } else {
+            Vec::new()
+        };
+
         let screenshot_params = || {
             let mut params = ScreenshotParams::builder().format(opts.format.cdp());
             if opts.format != Format::Png {
@@ -475,6 +515,9 @@ impl Session {
                     .context("failed to read selected element bounds")?;
                 let clip = round_clip(&bounds, *padding)
                     .with_context(|| format!("cannot capture selected element: {selector}"))?;
+                // Grow the clip to include nearby markers and labels so
+                // annotations are never cropped out of element captures.
+                let clip = union_clip(clip, &overlay_boxes, bounds.doc_width, bounds.doc_height);
                 let cdp_clip = ScreenshotViewport::builder()
                     .x(clip.x)
                     .y(clip.y)
@@ -541,6 +584,13 @@ impl Session {
             .as_f64()
             .map(|n| n as u32)
             .ok_or_else(|| anyhow!("expected a number from page"))
+    }
+
+    /// Draw annotation markers, labels, highlights, and dimming in-page and
+    /// return every overlay box in document coordinates.
+    async fn apply_overlays(&self, page: &Page, opts: &Opts) -> Result<Vec<OverlayBox>> {
+        let value = self.eval(page, overlay_js(opts)).await?;
+        serde_json::from_value(value).context("failed to read overlay boxes")
     }
 
     pub async fn close(mut self) {
@@ -764,6 +814,147 @@ fn element_bounds_js(selector: &str) -> String {
     )
 }
 
+/// Draw numbered markers, labels, outlines, and dimming as in-page DOM nodes.
+/// Returns every overlay box in document coordinates so element clips can grow
+/// to include them. Labels auto-place: prefer the right of the target, fall
+/// back to the left, then clamp into the document — never over the target.
+fn overlay_js(opts: &Opts) -> String {
+    let points: Vec<serde_json::Value> = opts
+        .annotations
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "selector": a.selector,
+                "label": a.label,
+                "number": a.number,
+            })
+        })
+        .collect();
+    let points = serde_json::to_string(&points).expect("annotations are serializable");
+    let highlights = serde_json::to_string(&opts.highlights).expect("highlights are serializable");
+    let dim = if opts.dim { "true" } else { "false" };
+    format!(
+        r##"(() => {{
+  const points = {points};
+  const highlights = {highlights};
+  const dim = {dim};
+  const boxes = [];
+  const find = (selector) => {{
+    try {{ return document.querySelector(selector); }}
+    catch {{ throw new Error("invalid selector: " + selector); }}
+  }};
+  const doc_width = Math.max(
+    document.body?.scrollWidth ?? 0,
+    document.documentElement.scrollWidth,
+    document.documentElement.clientWidth
+  );
+  const ORANGE = "#ff4d00";
+  const INK = "#141210";
+  if (dim) {{
+    const veil = document.createElement("div");
+    veil.dataset.iris = "dim";
+    veil.style.cssText = "position:fixed;inset:0;background:rgba(12,10,8,.45);"
+      + "z-index:2147483646;pointer-events:none;margin:0;padding:0;";
+    document.documentElement.appendChild(veil);
+  }}
+  const outline = (x, y, w, h) => {{
+    const frame = document.createElement("div");
+    frame.dataset.iris = "frame";
+    frame.style.cssText = "position:absolute;left:" + x + "px;top:" + y + "px;"
+      + "width:" + w + "px;height:" + h + "px;border:3px solid " + ORANGE + ";"
+      + "border-radius:6px;box-sizing:border-box;z-index:2147483647;"
+      + "pointer-events:none;margin:0;padding:0;";
+    document.body.appendChild(frame);
+    boxes.push({{ x, y, width: w, height: h }});
+  }};
+  const lift = (element) => {{
+    // Keep annotated targets bright above the dim veil.
+    if (getComputedStyle(element).position === "static") element.style.position = "relative";
+    element.style.zIndex = "2147483647";
+  }};
+  const place_label = (x, y, w, h, number, label) => {{
+    const marker = document.createElement("div");
+    marker.dataset.iris = "marker";
+    marker.textContent = String(number);
+    const mx = x - 16, my = y - 16;
+    marker.style.cssText = "position:absolute;left:" + mx + "px;top:" + my + "px;"
+      + "width:30px;height:30px;border-radius:50%;background:" + INK + ";color:#fff;"
+      + "border:2px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.45);"
+      + "font:700 15px/26px system-ui,sans-serif;text-align:center;"
+      + "z-index:2147483647;pointer-events:none;margin:0;padding:0;";
+    document.body.appendChild(marker);
+    boxes.push({{ x: mx, y: my, width: 30, height: 30 }});
+    const tag = document.createElement("div");
+    tag.dataset.iris = "label";
+    tag.textContent = label;
+    tag.style.cssText = "position:absolute;max-width:250px;background:" + INK + ";color:#fff;"
+      + "font:500 13px/1.35 system-ui,sans-serif;padding:7px 11px;border-radius:8px;"
+      + "box-shadow:0 1px 6px rgba(0,0,0,.45);z-index:2147483647;pointer-events:none;"
+      + "margin:0;white-space:normal;";
+    tag.style.visibility = "hidden";
+    document.body.appendChild(tag);
+    const tw = Math.min(tag.offsetWidth || 200, 250);
+    const th = tag.offsetHeight || 32;
+    let lx = x + w + 14;
+    if (lx + tw > doc_width - 4) lx = x - tw - 14; // fall back to the left
+    if (lx < 4) lx = Math.min(Math.max(x, 4), Math.max(doc_width - tw - 4, 4));
+    let ly = Math.max(y, 4);
+    tag.style.left = lx + "px";
+    tag.style.top = ly + "px";
+    tag.style.visibility = "visible";
+    boxes.push({{ x: lx, y: ly, width: tw, height: th }});
+  }};
+  for (const point of points) {{
+    const element = find(point.selector);
+    if (!element) throw new Error("annotation selector matched nothing: " + point.selector);
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + window.scrollX, y = rect.top + window.scrollY;
+    if (dim) lift(element);
+    outline(x, y, rect.width, rect.height);
+    place_label(x, y, rect.width, rect.height, point.number, point.label);
+  }}
+  for (const selector of highlights) {{
+    const element = find(selector);
+    if (!element) throw new Error("highlight selector matched nothing: " + selector);
+    const rect = element.getBoundingClientRect();
+    if (dim) lift(element);
+    outline(rect.left + window.scrollX, rect.top + window.scrollY, rect.width, rect.height);
+  }}
+  return boxes;
+}})()"##
+    )
+}
+
+/// Grow an element clip to include overlay boxes, clamped to the document.
+fn union_clip(
+    mut clip: ClipRect,
+    boxes: &[OverlayBox],
+    doc_width: f64,
+    doc_height: f64,
+) -> ClipRect {
+    let mut left = clip.x;
+    let mut top = clip.y;
+    let mut right = clip.x + clip.width;
+    let mut bottom = clip.y + clip.height;
+    for b in boxes {
+        if ![b.x, b.y, b.width, b.height].iter().all(|n| n.is_finite())
+            || b.width <= 0.0
+            || b.height <= 0.0
+        {
+            continue;
+        }
+        left = left.min(b.x - 4.0);
+        top = top.min(b.y - 4.0);
+        right = right.max(b.x + b.width + 4.0);
+        bottom = bottom.max(b.y + b.height + 4.0);
+    }
+    clip.x = left.clamp(0.0, doc_width);
+    clip.y = top.clamp(0.0, doc_height);
+    clip.width = right.clamp(0.0, doc_width) - clip.x;
+    clip.height = bottom.clamp(0.0, doc_height) - clip.y;
+    clip
+}
+
 fn round_clip(bounds: &ElementBounds, padding: u32) -> Result<ClipRect> {
     let padding = padding as f64;
     let left = (bounds.x - padding).floor().clamp(0.0, bounds.doc_width);
@@ -864,6 +1055,97 @@ mod tests {
                 height: 25.0,
             }
         );
+    }
+
+    #[test]
+    fn union_clip_grows_to_include_overlays_and_clamps_to_document() {
+        let clip = ClipRect {
+            x: 50.0,
+            y: 50.0,
+            width: 100.0,
+            height: 60.0,
+        };
+        let grown = union_clip(
+            clip,
+            &[
+                OverlayBox {
+                    x: 170.0,
+                    y: 20.0,
+                    width: 60.0,
+                    height: 30.0,
+                },
+                // Degenerate boxes are ignored, never shrink the clip.
+                OverlayBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 10.0,
+                },
+            ],
+            200.0,
+            200.0,
+        );
+        assert_eq!(
+            grown,
+            ClipRect {
+                x: 50.0,
+                y: 16.0,
+                width: 150.0,
+                height: 94.0,
+            }
+        );
+
+        let clamped = union_clip(
+            ClipRect {
+                x: 50.0,
+                y: 50.0,
+                width: 100.0,
+                height: 60.0,
+            },
+            &[OverlayBox {
+                x: 190.0,
+                y: 190.0,
+                width: 80.0,
+                height: 80.0,
+            }],
+            200.0,
+            200.0,
+        );
+        assert_eq!(
+            clamped,
+            ClipRect {
+                x: 50.0,
+                y: 50.0,
+                width: 150.0,
+                height: 150.0,
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_script_embeds_points_with_json_escaping() {
+        let opts = Opts {
+            viewport: Viewport::desktop(),
+            mode: CaptureMode::Viewport,
+            dark: false,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(3),
+            format: Format::Png,
+            annotations: vec![Annotation {
+                selector: "#search".into(),
+                label: "Find \"quoted\" \\ done".into(),
+                number: 2,
+            }],
+            highlights: vec!["#run-analysis".into()],
+            dim: true,
+        };
+        let js = overlay_js(&opts);
+        assert!(js.contains(
+            r##"{"label":"Find \"quoted\" \\ done","number":2,"selector":"#search"}"##,
+        ));
+        assert!(js.contains(r##"const highlights = ["#run-analysis"]"##));
+        assert!(js.contains("const dim = true;"));
     }
 
     #[test]
@@ -1056,6 +1338,9 @@ mod tests {
             wait_for: None,
             timeout: Duration::from_secs(3),
             format,
+            annotations: Vec::new(),
+            highlights: Vec::new(),
+            dim: false,
         }
     }
 
@@ -1068,6 +1353,9 @@ mod tests {
             wait_for: None,
             timeout: Duration::from_secs(5),
             format: Format::Png,
+            annotations: Vec::new(),
+            highlights: Vec::new(),
+            dim: false,
         }
     }
 

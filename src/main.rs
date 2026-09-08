@@ -86,6 +86,19 @@ struct CaptureArgs {
     #[arg(long, value_name = "CSS")]
     wait_for: Option<String>,
 
+    /// Point a numbered marker and label at an element: --point SELECTOR LABEL
+    /// (repeatable; numbering follows flag order)
+    #[arg(long = "point", value_names = ["SELECTOR", "LABEL"], num_args = 2)]
+    point: Vec<String>,
+
+    /// Outline the first element matching this CSS selector (repeatable)
+    #[arg(long, value_name = "CSS")]
+    highlight: Vec<String>,
+
+    /// Dim the page outside annotated and highlighted elements
+    #[arg(long)]
+    dim: bool,
+
     /// Device scale factor (overrides the preset's)
     #[arg(long, value_name = "N")]
     scale: Option<f64>,
@@ -124,6 +137,8 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
     let (targets, format) = resolve_outputs(&urls, cli.out.as_deref(), flag_format).await?;
     let jobs = cli.jobs.unwrap_or_else(|| urls.len().min(4)).max(1);
 
+    let annotations = build_annotations(&cli.point);
+
     let opts = Arc::new(Opts {
         viewport,
         mode: mode.clone(),
@@ -132,6 +147,9 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         wait_for: cli.wait_for,
         timeout: Duration::from_secs(cli.timeout.max(1)),
         format,
+        annotations,
+        highlights: cli.highlight,
+        dim: cli.dim,
     });
 
     let session = Arc::new(Session::launch(cli.chrome, viewport).await?);
@@ -167,6 +185,7 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
                             &mode,
                             format,
                             &shot,
+                            opts.annotations.len(),
                         ))?
                     );
                 } else {
@@ -208,6 +227,19 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Pair up flat `--point SELECTOR LABEL` values; numbering follows flag order.
+fn build_annotations(points: &[String]) -> Vec<capture::Annotation> {
+    points
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(i, pair)| capture::Annotation {
+            selector: pair[0].clone(),
+            label: pair[1].clone(),
+            number: i as u32 + 1,
+        })
+        .collect()
 }
 
 fn capture_mode(cli: &CaptureArgs) -> CaptureMode {
@@ -380,6 +412,60 @@ mod tests {
     }
 
     #[test]
+    fn point_flags_pair_up_with_flag_order_numbering() {
+        let cli = Cli::try_parse_from([
+            "iris",
+            "example.com",
+            "--point",
+            "#conditions-tab",
+            "Open Conditions",
+            "--point",
+            "#search",
+            "Find a condition",
+            "--highlight",
+            "#run-analysis",
+            "--dim",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.capture.point,
+            vec![
+                "#conditions-tab",
+                "Open Conditions",
+                "#search",
+                "Find a condition"
+            ]
+        );
+        assert_eq!(cli.capture.highlight, vec!["#run-analysis"]);
+        assert!(cli.capture.dim);
+
+        let annotations = build_annotations(&cli.capture.point);
+        assert_eq!(
+            annotations,
+            vec![
+                capture::Annotation {
+                    selector: "#conditions-tab".into(),
+                    label: "Open Conditions".into(),
+                    number: 1,
+                },
+                capture::Annotation {
+                    selector: "#search".into(),
+                    label: "Find a condition".into(),
+                    number: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn point_requires_both_selector_and_label() {
+        let error = Cli::try_parse_from(["iris", "example.com", "--point", "#only-selector"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::WrongNumberOfValues);
+    }
+
+    #[test]
     fn json_reports_have_stable_typed_fields() {
         let mode = CaptureMode::Element {
             selector: "h1".into(),
@@ -397,12 +483,24 @@ mod tests {
             &mode,
             Format::Png,
             &shot,
+            0,
         ))
         .unwrap();
         assert_eq!(
             success,
             r#"{"status":"ok","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}"#
         );
+
+        let annotated = serde_json::to_string(&success_report(
+            "https://example.com/",
+            Some(std::path::Path::new("/tmp/example.png")),
+            &mode,
+            Format::Png,
+            &shot,
+            2,
+        ))
+        .unwrap();
+        assert!(annotated.ends_with(r#""bytes":14231,"annotations":2}"#));
 
         let failure = serde_json::to_string(&capture::error_report(
             "https://example.com/",

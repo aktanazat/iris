@@ -13,6 +13,10 @@ iris -o shots/ a.com b.com c.com        # batch, captured concurrently
 cat urls.txt | iris - -o shots/         # batch from stdin (# comments ok)
 iris -o hero.jpg --wait-for 'h1' app.dev
 iris --selector 'h1' --json app.dev      # machine-readable JSON Lines
+iris app.dev \                            # annotated walkthrough step
+  --point '#conditions-tab' 'Open Conditions' \
+  --point '#search' 'Find a condition' \
+  --point '#run-analysis' 'Run analysis'
 ```
 
 `iris --full bridger.to` →
@@ -133,6 +137,7 @@ interaction scripting, or review tooling; use Iris only as the camera.
 - One browser process, concurrent tabs; a failed URL prints `✗` and never kills the batch (exit code 1 if anything failed)
 - Batch filenames derive from the URL (`example.com-pricing.png`); collisions get `-2`, `-3` suffixes
 - `--json` writes one JSON object per completed capture to stdout, in concurrent completion order; capture failures are JSON too and still produce exit code 1
+- Annotates before capturing: repeatable `--point 'SELECTOR' 'label'` draws a numbered marker, leader label, and outline (numbering follows flag order, labels auto-place beside the target); `--highlight 'CSS'` outlines elements; `--dim` dims the rest of the page. Element clips grow to include nearby markers so annotations are never cropped. The MCP `capture` tool takes the same `annotations`, `highlight`, and `dim` fields
 
 Element capture is intentionally CSS-selector based: Iris captures the first match in document order. `--selector` conflicts with `--full`; `--padding` requires it. Cross-origin iframe contents and capturing every match are not supported.
 
