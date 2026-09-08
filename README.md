@@ -138,6 +138,7 @@ interaction scripting, or review tooling; use Iris only as the camera.
 - Batch filenames derive from the URL (`example.com-pricing.png`); collisions get `-2`, `-3` suffixes
 - `--json` writes one JSON object per completed capture to stdout, in concurrent completion order; capture failures are JSON too and still produce exit code 1
 - Annotates before capturing: repeatable `--point 'SELECTOR' 'label'` draws a numbered marker, leader label, and outline (numbering follows flag order, labels auto-place beside the target); `--highlight 'CSS'` outlines elements; `--dim` dims the rest of the page. Element clips grow to include nearby markers so annotations are never cropped. The MCP `capture` tool takes the same `annotations`, `highlight`, and `dim` fields
+- Interacts before capturing: repeatable `--click 'TARGET'` (CSS or `text=...`), `--fill 'SELECTOR' 'TEXT'`, `--hover 'CSS'`, `--press KEY`, and `--open 'CSS'` (same action as click, for menus and drawers). Order is kept within each flag; different kinds run grouped as clicks, fills, hovers, presses. The MCP `capture` tool takes an ordered `steps` array for exact mixed ordering. A missing step target fails fast with a step-indexed error (e.g. `step 1 (click): target never appeared: #missing`)
 
 Element capture is intentionally CSS-selector based: Iris captures the first match in document order. `--selector` conflicts with `--full`; `--padding` requires it. Cross-origin iframe contents and capturing every match are not supported.
 

@@ -86,6 +86,24 @@ struct CaptureArgs {
     #[arg(long, value_name = "CSS")]
     wait_for: Option<String>,
 
+    /// Click the first match of SELECTOR (or `text=...` for the deepest
+    /// visible element containing the text) before capturing (repeatable,
+    /// flag order kept). `--open` is the same action, for menus and drawers.
+    #[arg(long, visible_alias = "open", value_name = "TARGET")]
+    click: Vec<String>,
+
+    /// Fill an input with text: --fill SELECTOR TEXT (repeatable, flag order kept)
+    #[arg(long = "fill", value_names = ["SELECTOR", "TEXT"], num_args = 2)]
+    fill: Vec<String>,
+
+    /// Hover the first match of this CSS selector before capturing (repeatable)
+    #[arg(long, value_name = "CSS")]
+    hover: Vec<String>,
+
+    /// Press a keyboard key before capturing, e.g. Enter or Escape (repeatable)
+    #[arg(long, value_name = "KEY")]
+    press: Vec<String>,
+
     /// Point a numbered marker and label at an element: --point SELECTOR LABEL
     /// (repeatable; numbering follows flag order)
     #[arg(long = "point", value_names = ["SELECTOR", "LABEL"], num_args = 2)]
@@ -139,6 +157,7 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
 
     let annotations = build_annotations(&cli.point);
 
+    let steps = build_steps(&cli);
     let opts = Arc::new(Opts {
         viewport,
         mode: mode.clone(),
@@ -150,6 +169,7 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         annotations,
         highlights: cli.highlight,
         dim: cli.dim,
+        steps,
     });
 
     let session = Arc::new(Session::launch(cli.chrome, viewport).await?);
@@ -240,6 +260,41 @@ fn build_annotations(points: &[String]) -> Vec<capture::Annotation> {
             number: i as u32 + 1,
         })
         .collect()
+}
+
+/// Build the pre-capture interaction list. Order is kept within each flag;
+/// different kinds run grouped — clicks, then fills, hovers, presses — so
+/// exact mixed ordering belongs in MCP `steps` or a workflow file.
+fn build_steps(cli: &CaptureArgs) -> Vec<capture::InteractionStep> {
+    let mut steps = Vec::new();
+    steps.extend(
+        cli.click
+            .iter()
+            .map(|selector| capture::InteractionStep::Click {
+                selector: selector.clone(),
+            }),
+    );
+    steps.extend(
+        cli.fill
+            .chunks_exact(2)
+            .map(|pair| capture::InteractionStep::Fill {
+                selector: pair[0].clone(),
+                text: pair[1].clone(),
+            }),
+    );
+    steps.extend(
+        cli.hover
+            .iter()
+            .map(|selector| capture::InteractionStep::Hover {
+                selector: selector.clone(),
+            }),
+    );
+    steps.extend(
+        cli.press
+            .iter()
+            .map(|key| capture::InteractionStep::Press { key: key.clone() }),
+    );
+    steps
 }
 
 fn capture_mode(cli: &CaptureArgs) -> CaptureMode {
@@ -452,6 +507,49 @@ mod tests {
                     selector: "#search".into(),
                     label: "Find a condition".into(),
                     number: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn interaction_flags_keep_order_within_kind_and_group_across_kinds() {
+        let cli = Cli::try_parse_from([
+            "iris",
+            "example.com",
+            "--click",
+            "text=Conditions",
+            "--open",
+            "#drawer",
+            "--fill",
+            "#search",
+            "asthma",
+            "--hover",
+            "#menu",
+            "--press",
+            "Enter",
+        ])
+        .unwrap();
+        // --open is the same action as --click and shares its order.
+        assert_eq!(cli.capture.click, vec!["text=Conditions", "#drawer"]);
+        assert_eq!(
+            build_steps(&cli.capture),
+            vec![
+                capture::InteractionStep::Click {
+                    selector: "text=Conditions".into(),
+                },
+                capture::InteractionStep::Click {
+                    selector: "#drawer".into(),
+                },
+                capture::InteractionStep::Fill {
+                    selector: "#search".into(),
+                    text: "asthma".into(),
+                },
+                capture::InteractionStep::Hover {
+                    selector: "#menu".into(),
+                },
+                capture::InteractionStep::Press {
+                    key: "Enter".into()
                 },
             ]
         );

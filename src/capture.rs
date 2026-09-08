@@ -159,11 +159,36 @@ pub struct Opts {
     pub annotations: Vec<Annotation>,
     pub highlights: Vec<String>,
     pub dim: bool,
+    pub steps: Vec<InteractionStep>,
 }
 
 impl Opts {
     pub fn overlays_enabled(&self) -> bool {
         !self.annotations.is_empty() || !self.highlights.is_empty() || self.dim
+    }
+}
+
+/// One pre-capture interaction, run in order after navigation settles.
+/// Selectors use first-match semantics; `click` also accepts `text=...` to
+/// match the deepest visible element containing the given text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InteractionStep {
+    Click { selector: String },
+    Fill { selector: String, text: String },
+    Hover { selector: String },
+    Press { key: String },
+    WaitFor { selector: String },
+}
+
+impl InteractionStep {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Click { .. } => "click",
+            Self::Fill { .. } => "fill",
+            Self::Hover { .. } => "hover",
+            Self::Press { .. } => "press",
+            Self::WaitFor { .. } => "wait_for",
+        }
     }
 }
 
@@ -424,6 +449,19 @@ impl Session {
                 .saturating_sub(Duration::from_millis(500));
             self.eval(page, wait_for_js(selector, budget.as_millis() as u64))
                 .await?;
+        }
+        if !opts.steps.is_empty() {
+            for (index, step) in opts.steps.iter().enumerate() {
+                let budget = opts
+                    .timeout
+                    .saturating_sub(started.elapsed())
+                    .saturating_sub(Duration::from_millis(500));
+                self.eval(page, interaction_js(step, index, budget.as_millis() as u64))
+                    .await?;
+            }
+            // Interactions can start image loads, IntersectionObservers, and
+            // transitions that the initial settle could not see.
+            self.eval(page, SETTLE_JS.into()).await?;
         }
         match &opts.mode {
             CaptureMode::Viewport => {}
@@ -814,6 +852,160 @@ fn element_bounds_js(selector: &str) -> String {
     )
 }
 
+/// Build the in-page script for one interaction step. Each script polls for its
+/// target inside the remaining budget and throws a step-indexed error, which
+/// `eval` surfaces instead of a generic timeout.
+fn interaction_js(step: &InteractionStep, index: usize, budget_ms: u64) -> String {
+    let label = format!("step {} ({})", index + 1, step.kind());
+    let label = serde_json::to_string(&label).expect("step label is serializable");
+    let prelude = format!(
+        r##"const deadline = Date.now() + {budget_ms};
+  const label = {label};
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const frames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const query = (selector) => {{
+    try {{ return document.querySelector(selector); }}
+    catch {{ throw new Error("invalid selector: " + selector); }}
+  }};"##
+    );
+    match step {
+        InteractionStep::Click { selector } => {
+            let target = serde_json::to_string(selector).expect("selector is serializable");
+            format!(
+                r##"(async () => {{
+  {prelude}
+  const target = {target};
+  const find = () => {{
+    if (target.startsWith("text=")) {{
+      const needle = target.slice(5).trim().toLowerCase();
+      if (!needle) throw new Error(label + ": text= needs a value to match");
+      // Reverse document order finds the deepest visible match first, so a
+      // button wins over the containers holding it.
+      const all = Array.from(document.querySelectorAll("body *")).reverse();
+      for (const el of all) {{
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const text = ((el.innerText ?? el.textContent) || "").trim().toLowerCase();
+        if (text && text.includes(needle)) return el;
+      }}
+      return null;
+    }}
+    return query(target);
+  }};
+  let element = null;
+  while (!(element = find())) {{
+    if (Date.now() >= deadline) throw new Error(label + ": target never appeared: " + target);
+    await sleep(100);
+  }}
+  element.scrollIntoView({{ block: "center", inline: "center" }});
+  await frames();
+  element.click();
+}})()"##
+            )
+        }
+        InteractionStep::Fill { selector, text } => {
+            let selector = serde_json::to_string(selector).expect("selector is serializable");
+            let text = serde_json::to_string(text).expect("fill text is serializable");
+            format!(
+                r##"(async () => {{
+  {prelude}
+  const selector = {selector};
+  const text = {text};
+  let element = null;
+  while (!(element = query(selector))) {{
+    if (Date.now() >= deadline) throw new Error(label + ": target never appeared: " + selector);
+    await sleep(100);
+  }}
+  element.scrollIntoView({{ block: "center", inline: "center" }});
+  await frames();
+  const fire = (type) => element.dispatchEvent(new Event(type, {{ bubbles: true }}));
+  if (element.isContentEditable) {{
+    element.focus();
+    document.execCommand("selectAll", false, null);
+    if (!document.execCommand("insertText", false, text)) element.textContent = text;
+    fire("input");
+  }} else if (element.tagName === "SELECT") {{
+    const wanted = text.trim().toLowerCase();
+    const options = Array.from(element.options);
+    const match = options.find(o => o.value.toLowerCase() === wanted)
+      || options.find(o => (o.text || "").trim().toLowerCase() === wanted);
+    if (!match) throw new Error(label + ": no option matches: " + text);
+    element.value = match.value;
+    fire("input");
+    fire("change");
+  }} else if (element.tagName === "INPUT" && ["checkbox", "radio"].includes(element.type)) {{
+    const wanted = text.trim().toLowerCase();
+    element.checked = ["true", "1", "check", "checked", "on", "yes"].includes(wanted);
+    fire("input");
+    fire("change");
+  }} else if ("value" in element) {{
+    // The native setter (not a plain assignment) notifies framework bindings.
+    const proto = element.tagName === "TEXTAREA"
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(element, text);
+    fire("input");
+    fire("change");
+  }} else {{
+    throw new Error(label + ": cannot fill this element: " + selector);
+  }}
+}})()"##
+            )
+        }
+        InteractionStep::Hover { selector } => {
+            let selector = serde_json::to_string(selector).expect("selector is serializable");
+            format!(
+                r##"(async () => {{
+  {prelude}
+  const selector = {selector};
+  let element = null;
+  while (!(element = query(selector))) {{
+    if (Date.now() >= deadline) throw new Error(label + ": target never appeared: " + selector);
+    await sleep(100);
+  }}
+  element.scrollIntoView({{ block: "center", inline: "center" }});
+  await frames();
+  // Synthetic events reach JS listeners; CSS :hover may not apply to them.
+  try {{ element.focus({{ preventScroll: true }}); }} catch {{}}
+  const rect = element.getBoundingClientRect();
+  const at = {{ bubbles: true, cancelable: true, view: window,
+    clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 }};
+  element.dispatchEvent(new PointerEvent("pointerover", at));
+  element.dispatchEvent(new MouseEvent("mouseover", at));
+  element.dispatchEvent(new MouseEvent("mouseenter", at));
+}})()"##
+            )
+        }
+        InteractionStep::Press { key } => {
+            let key = serde_json::to_string(key).expect("key is serializable");
+            format!(
+                r##"(() => {{
+  {prelude}
+  const key = {key};
+  if (!key) throw new Error(label + ": press needs a key");
+  const target = document.activeElement || document.body;
+  for (const type of ["keydown", "keypress", "keyup"]) {{
+    target.dispatchEvent(new KeyboardEvent(type, {{ key, bubbles: true, cancelable: true, view: window }}));
+  }}
+}})()"##
+            )
+        }
+        InteractionStep::WaitFor { selector } => {
+            let selector = serde_json::to_string(selector).expect("selector is serializable");
+            format!(
+                r##"(async () => {{
+  {prelude}
+  const selector = {selector};
+  while (!query(selector)) {{
+    if (Date.now() >= deadline) throw new Error(label + ": target never appeared: " + selector);
+    await sleep(100);
+  }}
+}})()"##
+            )
+        }
+    }
+}
+
 /// Draw numbered markers, labels, outlines, and dimming as in-page DOM nodes.
 /// Returns every overlay box in document coordinates so element clips can grow
 /// to include them. Labels auto-place: prefer the right of the target, fall
@@ -1123,6 +1315,63 @@ mod tests {
     }
 
     #[test]
+    fn interaction_scripts_carry_step_labels_and_escaped_values() {
+        let click = interaction_js(
+            &InteractionStep::Click {
+                selector: "text=Run \"analysis\"".into(),
+            },
+            1,
+            2500,
+        );
+        assert!(click.contains(r#"const label = "step 2 (click)""#));
+        assert!(click.contains("Date.now() + 2500"));
+        assert!(click.contains(r#"startsWith("text=")"#));
+        assert!(click.contains("Run \\\"analysis\\\""));
+
+        let fill = interaction_js(
+            &InteractionStep::Fill {
+                selector: "#search".into(),
+                text: "a'b\"c\\d".into(),
+            },
+            0,
+            1000,
+        );
+        assert!(fill.contains(r#"const label = "step 1 (fill)""#));
+        assert!(fill.contains("getOwnPropertyDescriptor"));
+        assert!(fill.contains("a'b\\\"c\\\\d"));
+
+        let hover = interaction_js(
+            &InteractionStep::Hover {
+                selector: "#menu".into(),
+            },
+            2,
+            1000,
+        );
+        assert!(hover.contains(r#"const label = "step 3 (hover)""#));
+        assert!(hover.contains("pointerover"));
+
+        let press = interaction_js(
+            &InteractionStep::Press {
+                key: "Enter".into(),
+            },
+            3,
+            1000,
+        );
+        assert!(press.contains(r#"const label = "step 4 (press)""#));
+        assert!(press.contains(r#"const key = "Enter""#));
+
+        let wait = interaction_js(
+            &InteractionStep::WaitFor {
+                selector: "[role=dialog]".into(),
+            },
+            4,
+            1000,
+        );
+        assert!(wait.contains(r#"const label = "step 5 (wait_for)""#));
+        assert!(wait.contains("target never appeared"));
+    }
+
+    #[test]
     fn overlay_script_embeds_points_with_json_escaping() {
         let opts = Opts {
             viewport: Viewport::desktop(),
@@ -1139,6 +1388,7 @@ mod tests {
             }],
             highlights: vec!["#run-analysis".into()],
             dim: true,
+            steps: Vec::new(),
         };
         let js = overlay_js(&opts);
         assert!(js.contains(
@@ -1326,6 +1576,116 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn browser_interaction_contract() -> Result<()> {
+        let temp = std::env::temp_dir().join(format!("iris-interact-{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp).await?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/interact.html")
+            .canonicalize()?;
+        let url = url::Url::from_file_path(&fixture)
+            .map_err(|_| anyhow!("fixture path is not a file URL"))?;
+        let viewport = Viewport {
+            width: 480,
+            height: 360,
+            scale: 1.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+
+        // The dialog is absent from the DOM until the button is clicked:
+        // without steps the element wait expires instead of capturing.
+        let hidden = session
+            .capture(
+                url.as_str(),
+                &element_opts(viewport, "#dialog", 0, Format::Png),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{hidden:#}").contains("selector never appeared: #dialog"));
+
+        // A text= click opens the dialog; the follow-up element capture only
+        // succeeds when the click really ran.
+        let dialog_path = temp.join("dialog.png");
+        let dialog = capture_to(
+            &session,
+            url.as_str(),
+            &dialog_path,
+            &step_opts(
+                viewport,
+                vec![InteractionStep::Click {
+                    selector: "text=Run analysis".into(),
+                }],
+                CaptureMode::Element {
+                    selector: "#dialog".into(),
+                    padding: 0,
+                },
+            ),
+        )
+        .await?;
+        assert_eq!(dialog.width, 220);
+        assert!(dialog.height >= 60);
+
+        // Fill + key press run cleanly ahead of a viewport capture.
+        let filled_path = temp.join("filled.png");
+        let filled = capture_to(
+            &session,
+            url.as_str(),
+            &filled_path,
+            &step_opts(
+                viewport,
+                vec![
+                    InteractionStep::Fill {
+                        selector: "#search".into(),
+                        text: "asthma".into(),
+                    },
+                    InteractionStep::Press {
+                        key: "Enter".into(),
+                    },
+                ],
+                CaptureMode::Viewport,
+            ),
+        )
+        .await?;
+        assert_eq!((filled.width, filled.height), (480, 360));
+
+        // A missing step target names its step instead of timing out blandly.
+        let missing = session
+            .capture(
+                url.as_str(),
+                &step_opts(
+                    viewport,
+                    vec![InteractionStep::Click {
+                        selector: "#missing".into(),
+                    }],
+                    CaptureMode::Viewport,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{missing:#}").contains("step 1 (click): target never appeared: #missing"));
+
+        session.close().await;
+        tokio::fs::remove_dir_all(temp).await?;
+        Ok(())
+    }
+
+    fn step_opts(viewport: Viewport, steps: Vec<InteractionStep>, mode: CaptureMode) -> Opts {
+        Opts {
+            viewport,
+            mode,
+            dark: false,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(4),
+            format: Format::Png,
+            annotations: Vec::new(),
+            highlights: Vec::new(),
+            dim: false,
+            steps,
+        }
+    }
+
     fn element_opts(viewport: Viewport, selector: &str, padding: u32, format: Format) -> Opts {
         Opts {
             viewport,
@@ -1341,6 +1701,7 @@ mod tests {
             annotations: Vec::new(),
             highlights: Vec::new(),
             dim: false,
+            steps: Vec::new(),
         }
     }
 
@@ -1356,6 +1717,7 @@ mod tests {
             annotations: Vec::new(),
             highlights: Vec::new(),
             dim: false,
+            steps: Vec::new(),
         }
     }
 

@@ -48,6 +48,8 @@ pub struct CaptureRequest {
     wait_ms: u64,
     /// Wait until this CSS selector exists before capturing.
     wait_for: Option<String>,
+    /// Ordered interactions to perform before capturing.
+    steps: Option<Vec<StepRequest>>,
     /// Numbered markers with labels pointing at elements, in list order.
     annotations: Option<Vec<AnnotationRequest>>,
     /// Outline the first element matching each CSS selector.
@@ -69,6 +71,38 @@ pub struct AnnotationRequest {
     selector: String,
     /// Short label shown beside the marker.
     label: String,
+}
+
+/// One pre-capture interaction. Array order is the execution order.
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum StepRequest {
+    Click {
+        /// CSS selector or `text=...` to click.
+        click: String,
+    },
+    Open {
+        /// CSS selector to open (menus, drawers); same action as click.
+        open: String,
+    },
+    Fill {
+        /// CSS selector of the input to fill.
+        fill: String,
+        /// Text to type into the input.
+        text: String,
+    },
+    Hover {
+        /// CSS selector to hover.
+        hover: String,
+    },
+    Press {
+        /// Keyboard key to press, e.g. Enter or Escape.
+        press: String,
+    },
+    WaitFor {
+        /// Wait until this CSS selector exists before continuing.
+        wait_for: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
@@ -174,6 +208,46 @@ impl CaptureRequest {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let steps = self
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let at = format!("steps[{i}]");
+                let non_empty = |value: String, field: &str| {
+                    let value = value.trim().to_owned();
+                    if value.is_empty() {
+                        bail!("{at}.{field} must not be empty");
+                    }
+                    Ok(value)
+                };
+                match step {
+                    StepRequest::Click { click } => Ok(crate::capture::InteractionStep::Click {
+                        selector: non_empty(click, "click")?,
+                    }),
+                    StepRequest::Open { open } => Ok(crate::capture::InteractionStep::Click {
+                        selector: non_empty(open, "open")?,
+                    }),
+                    StepRequest::Fill { fill, text } => Ok(crate::capture::InteractionStep::Fill {
+                        selector: non_empty(fill, "fill")?,
+                        text: text.trim().to_owned(),
+                    }),
+                    StepRequest::Hover { hover } => Ok(crate::capture::InteractionStep::Hover {
+                        selector: non_empty(hover, "hover")?,
+                    }),
+                    StepRequest::Press { press } => Ok(crate::capture::InteractionStep::Press {
+                        key: non_empty(press, "press")?,
+                    }),
+                    StepRequest::WaitFor { wait_for } => {
+                        Ok(crate::capture::InteractionStep::WaitFor {
+                            selector: non_empty(wait_for, "wait_for")?,
+                        })
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut format = self
             .format
             .map(ImageFormat::capture_format)
@@ -201,6 +275,7 @@ impl CaptureRequest {
                 annotations,
                 highlights,
                 dim: self.dim,
+                steps,
             },
         })
     }
@@ -456,6 +531,7 @@ mod tests {
             annotations: None,
             highlight: None,
             dim: false,
+            steps: None,
         }
     }
 
@@ -545,6 +621,67 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("highlight[0] must not be empty")
+        );
+    }
+
+    #[test]
+    fn step_requests_keep_array_order_and_reject_empties() {
+        let mut capture = request("example.com");
+        capture.steps = Some(vec![
+            StepRequest::Click {
+                click: " text=Conditions ".into(),
+            },
+            StepRequest::Open {
+                open: "#drawer".into(),
+            },
+            StepRequest::Fill {
+                fill: "#search".into(),
+                text: "asthma".into(),
+            },
+            StepRequest::Hover {
+                hover: "#menu".into(),
+            },
+            StepRequest::Press {
+                press: "Enter".into(),
+            },
+            StepRequest::WaitFor {
+                wait_for: "[role=dialog]".into(),
+            },
+        ]);
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(
+            prepared.opts.steps,
+            vec![
+                crate::capture::InteractionStep::Click {
+                    selector: "text=Conditions".into(),
+                },
+                crate::capture::InteractionStep::Click {
+                    selector: "#drawer".into(),
+                },
+                crate::capture::InteractionStep::Fill {
+                    selector: "#search".into(),
+                    text: "asthma".into(),
+                },
+                crate::capture::InteractionStep::Hover {
+                    selector: "#menu".into(),
+                },
+                crate::capture::InteractionStep::Press {
+                    key: "Enter".into()
+                },
+                crate::capture::InteractionStep::WaitFor {
+                    selector: "[role=dialog]".into(),
+                },
+            ]
+        );
+
+        let mut empty = request("example.com");
+        empty.steps = Some(vec![StepRequest::Click { click: "  ".into() }]);
+        assert!(
+            empty
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("steps[0].click must not be empty")
         );
     }
 
