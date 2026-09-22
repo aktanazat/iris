@@ -1,31 +1,66 @@
-name: CI
+name: Working-tree verification
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: Base64 source archive
+        type: string
+        required: true
+      sha256:
+        description: Archive SHA-256
+        type: string
+        required: true
+
+permissions:
+  contents: read
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: brijr/iris
+          ref: 227d3109be29c87c2bed85d214c122795a640210
+          path: baseline
+          persist-credentials: false
+      - name: Unpack the supplied source
+        env:
+          SOURCE_ARCHIVE: ${{ inputs.archive }}
+          SOURCE_SHA256: ${{ inputs.sha256 }}
+        run: |
+          python3 -c '
+          import base64, hashlib, io, os, tarfile
+          archive = base64.b64decode(os.environ["SOURCE_ARCHIVE"], validate=True)
+          digest = hashlib.sha256(archive).hexdigest()
+          assert digest == os.environ["SOURCE_SHA256"], digest
+          with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+              bundle.extractall("candidate", filter="data")
+          print("source archive sha256:", digest)
+          '
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
-      - run: cargo build
-
-  audit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2.0.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          workspaces: candidate -> target
+      - name: Install image decoding for the smoke scripts
+        run: |
+          python3 -m venv verification-python
+          verification-python/bin/pip install pillow
+      - name: Build and exercise the supplied source
+        working-directory: candidate
+        run: ../verification-python/bin/python verify-remote.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iris-verification-${{ runner.os }}-${{ runner.arch }}
+          path: candidate/proof
+          if-no-files-found: error
+          retention-days: 7
