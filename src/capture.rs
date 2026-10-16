@@ -547,6 +547,9 @@ impl Session {
             if scale <= 0.0 {
                 bail!("pixel budget is too small for this capture's aspect ratio");
             }
+        } else if matches!(opts.mode, CaptureMode::FullPage) && clip.height * scale > 16_000.0 {
+            // Past Chrome's ~16k px render limit, full pages fall back to 1x.
+            scale = 1.0;
         }
         let capture_started = Instant::now();
         let mut params = CaptureScreenshotParams::builder()
@@ -1056,6 +1059,68 @@ mod tests {
         assert!(parse_viewport("1440x0", None).is_err());
         assert!(parse_viewport("desktop", Some(0.0)).is_err());
         assert!(parse_viewport("desktop", Some(f64::NAN)).is_err());
+    }
+
+    #[tokio::test]
+    async fn full_page_capture_keeps_viewport_relative_heights() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/full-page-layout.html")
+            .canonicalize()?;
+        let url = Url::from_file_path(fixture).map_err(|_| anyhow!("invalid fixture URL"))?;
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 2.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let capture = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::FullPage, false),
+            )
+            .await;
+        session.close().await;
+        let capture = capture?;
+
+        // A 100vh header, 900px main, and 100px footer make a 1240px page.
+        assert_eq!(
+            (capture.shot.width, capture.shot.height, capture.shot.scale),
+            (320, 1240, 2.0)
+        );
+        let image = image::load_from_memory(&capture.pixels()?)?.to_rgb8();
+        assert_eq!(image.dimensions(), (640, 2480));
+        // The header stays one viewport (240px, 480 device pixels) tall.
+        assert_eq!(image.get_pixel(320, 479).0, [22, 78, 154]);
+        assert_eq!(image.get_pixel(320, 480).0, [233, 138, 34]);
+        assert_eq!(image.get_pixel(320, 2479).0, [39, 133, 74]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_page_capture_past_the_render_limit_falls_back_to_1x() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
+        let url =
+            "data:text/html,<style>html,body{margin:0}main{height:9000px}</style><main></main>";
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 2.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let capture = session
+            .capture(url, &page_opts(viewport, CaptureMode::FullPage, false))
+            .await;
+        session.close().await;
+        let capture = capture?;
+
+        // 9000 CSS px at 2x would be 18,000 device px.
+        assert_eq!(capture.shot.scale, 1.0);
+        let image = image::load_from_memory(&capture.pixels()?)?.to_rgb8();
+        assert_eq!(image.dimensions(), (320, 9000));
+        Ok(())
     }
 
     #[tokio::test]

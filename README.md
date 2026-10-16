@@ -137,8 +137,7 @@ interaction scripting, or review tooling; use Iris only as the camera.
 - Waits for fonts, image loads, and finite entrance animations under one shared three-second budget. Rendered-frame waits and full-page scrolling also count toward the capture timeout.
 - Captures the first matching element with `--selector`, automatically scrolling it into view and settling newly visible content before framing it
 - Serves the same capture engine to coding agents with `iris mcp`, returning pixels inline instead of making the agent locate a file
-- Keeps the requested viewport for full-page screenshots, so `vh` units and responsive breakpoints do not change
-- Retina `@2x` output by default; `--max-pixels` lowers output density without resizing the page
+- Retina `@2x` output by default; full pages taller than Chrome's ~16k px render limit fall back to `@1x` automatically (the report tells you which you got); `--max-pixels` lowers output density without resizing the page
 - Image format from the `-o` extension or `--format`: `png` (default), `jpg`, `webp`; `--quality` controls JPEG/WebP encoding (0–100, default 90)
 - One browser process, concurrent headless windows; a failed URL prints `✗` and never kills the batch (exit code 1 if anything failed)
 - Batch filenames derive from the URL (`example.com-pricing.png`); collisions get `-2`, `-3` suffixes
@@ -224,14 +223,6 @@ Cancelling an MCP request stops queued work and in-progress captures. Comparison
 
 A pixel budget too small to retain at least one pixel on each axis returns an error.
 
-## Full-page framing
-
-Both images use the same page and a 320×240 viewport. The page starts with a `100vh` blue section, followed by orange and green sections. The old capture resized the viewport to the document height, making the blue section cover the image.
-
-| Before | After |
-| --- | --- |
-| <img src=".github/full-page-before.png" width="160" alt="Blue section incorrectly fills the image"> | <img src=".github/full-page-after.png" width="160" alt="Blue, orange, and green sections retain their layout"> |
-
 ## Compare saved captures
 
 `iris compare before.png after.png --threshold 8 -o diff.png` prints a JSON report. A pixel changes when its largest channel difference exceeds the threshold. Transparent pixels are composited on white.
@@ -239,25 +230,6 @@ Both images use the same page and a 320×240 viewport. The page starts with a `1
 Different dimensions are compared on the union canvas without rescaling. Pixels present in only one image count as changed. The optional PNG marks changed pixels red.
 
 Comparison errors exit nonzero. A nonzero change count is a result, not a command failure.
-
-## Optional report judgments
-
-An agent can pass selected capture metadata to an external typed judge such as Jev when the next framing decision depends on the task. Iris itself makes no inference calls. Prefer fixed rules for known conditions such as a pending font.
-
-For example, keep URLs, titles, selectors, and file paths out of the submitted state:
-
-```sh
-iris https://example.com --full --max-pixels 1500000 --json -o page.png |
-  jq '{task: "inspect the footer", capture: {
-    status, mode, css_width, css_height, scale, warnings,
-    page: (.page | {document_width, document_height, pending_images,
-                   failed_images, fonts_pending, running_animations})
-  }}' > capture-state.json
-jev bool "Does the report suggest this framing can include the requested content? Do not judge unseen pixels." \
-  --state @capture-state.json
-```
-
-Jev is optional and installed separately. That command sends the selected state and question to its configured provider. Its answer is advisory; it cannot certify an unseen image or replace looking at it. Keep ordinary captures on the local path.
 
 ## License
 
