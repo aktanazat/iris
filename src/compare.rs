@@ -280,12 +280,11 @@ fn on_white(pixel: &[u8]) -> [u8; 3] {
         return [pixel[0], pixel[1], pixel[2]];
     }
     let white = 255 * (255 - alpha);
-    let over = |channel: u8| {
-        // SAFETY: the rounded numerator is at most 255 * 255 + 127.
+    [pixel[0], pixel[1], pixel[2]].map(|channel| {
+        // SAFETY: channel * alpha + white <= 255 * 255, so the rounded quotient fits in a u8.
         u8::try_from((u32::from(channel) * alpha + white + 127) / 255)
             .expect("alpha compositing must stay within a channel")
-    };
-    [over(pixel[0]), over(pixel[1]), over(pixel[2])]
+    })
 }
 
 /// Largest per-channel gap between two composited pixels.
