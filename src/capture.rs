@@ -644,8 +644,51 @@ impl Session {
             let _ = self.browser.kill().await;
         }
         self.handler.abort();
+        reap_profile_processes(self.profile_dir.path()).await;
         let _ = tokio::fs::remove_dir_all(self.profile_dir.path()).await;
     }
+}
+
+/// Chromium helpers can outlive the browser: Helium leaves its network
+/// service running, reparented to launchd. Stop every process still started
+/// with this session's profile, politely first.
+async fn reap_profile_processes(profile: &Path) {
+    let marker = format!("--user-data-dir={}", profile.display());
+    for signal in ["-TERM", "-KILL"] {
+        let table = process_table();
+        let pids = profile_pids(&table, &marker);
+        if pids.is_empty() {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .arg(signal)
+            .args(&pids)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !profile_pids(&process_table(), &marker).is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn process_table() -> String {
+    std::process::Command::new("ps")
+        .args(["axww", "-o", "pid=,command="])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// PIDs whose command line names exactly `marker` as an argument, so the
+/// profile `...-1` never matches a sibling session's `...-10`.
+fn profile_pids<'a>(table: &'a str, marker: &str) -> Vec<&'a str> {
+    table
+        .lines()
+        .filter(|line| line.split_whitespace().any(|arg| arg == marker))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
 }
 
 pub fn parse_viewport(size: &str, scale: Option<f64>) -> Result<Viewport> {
@@ -896,6 +939,20 @@ fn round_clip(bounds: &ElementBounds, padding: u32) -> Result<ClipRect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_pids_match_the_whole_profile_argument() {
+        let table = concat!(
+            "  101 /Apps/Helium --user-data-dir=/tmp/iris-chrome-7-1 --headless\n",
+            "  102 /Apps/Helium Helper --type=utility --user-data-dir=/tmp/iris-chrome-7-10\n",
+            "  103 /Apps/Helium Helper --type=renderer --user-data-dir=/tmp/iris-chrome-7-1\n",
+        );
+
+        assert_eq!(
+            profile_pids(table, "--user-data-dir=/tmp/iris-chrome-7-1"),
+            ["101", "103"]
+        );
+    }
 
     #[test]
     fn clip_rounds_outward_and_applies_padding() {
