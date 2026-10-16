@@ -369,10 +369,12 @@ impl Session {
         if let Some(path) = chrome.or_else(find_chrome) {
             config = config.chrome_executable(path);
         }
-        let config = config.build().map_err(|e| anyhow!(e))?;
+        let config = config
+            .build()
+            .map_err(|e| anyhow!("{e}: set CHROME=/path/to/browser or pass --chrome"))?;
         let (browser, mut handler) = Browser::launch(config)
             .await
-            .context("failed to launch Chrome (install Google Chrome or pass --chrome)")?;
+            .context("failed to launch Chrome (install a Chrome-family browser, set CHROME, or pass --chrome)")?;
         // Newer Chrome versions emit CDP messages chromiumoxide can't deserialize
         // (Serde errors) — harmless, keep pumping. Transport errors mean the
         // connection is gone, so stop.
@@ -712,6 +714,7 @@ fn find_chrome() -> Option<PathBuf> {
         "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
         "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Helium.app/Contents/MacOS/Helium",
     ];
     #[cfg(windows)]
     const CANDIDATES: &[&str] = &[

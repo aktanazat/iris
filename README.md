@@ -36,7 +36,7 @@ cargo install iris-screenshot
 
 The crates.io package is named `iris-screenshot`; the installed command is `iris`.
 
-The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, or Brave).
+The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, Brave, or Helium). For any other Chromium build, set `CHROME=/path/to/browser` or pass `--chrome`.
 Building from source requires Rust 1.88 or newer.
 
 ## Give your coding agent eyes
