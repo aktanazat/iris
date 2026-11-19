@@ -685,6 +685,14 @@ const SCROLL_JS: &str = r#"(async () => {
   }
   window.scrollTo(0, 0);
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  await Promise.all(Array.from(document.images)
+    .filter(img => !img.complete && (img.currentSrc || img.src))
+    .map(img => new Promise(r => {
+      img.addEventListener('load', r, { once: true });
+      img.addEventListener('error', r, { once: true });
+      setTimeout(r, 3000);
+    })));
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 })()"#;
 
 const DOC_HEIGHT_JS: &str = r#"Math.max(
