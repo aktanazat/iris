@@ -382,7 +382,9 @@ impl Session {
         page.goto(url).await?;
         page.wait_for_navigation().await?;
 
-        self.eval(page, SETTLE_JS.into()).await?;
+        if !matches!(opts.mode, CaptureMode::Element { .. }) {
+            self.eval(page, SETTLE_JS.into()).await?;
+        }
         if let Some(selector) = &opts.wait_for {
             // Undercut the outer timeout so the descriptive selector error surfaces
             // instead of a generic "timed out".
@@ -409,7 +411,7 @@ impl Session {
                 )
                 .await?;
                 // Scrolling can start image loads, IntersectionObservers, and
-                // entrance transitions that the initial settle could not see.
+                // entrance transitions that need to settle before capture.
                 self.eval(page, SETTLE_JS.into()).await?;
             }
         }
@@ -679,10 +681,17 @@ const SCROLL_JS: &str = r#"(async () => {
   const step = Math.max(200, window.innerHeight);
   for (let y = 0, guard = 0; y < height() && guard < 500; y += step, guard++) {
     window.scrollTo(0, y);
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   }
   window.scrollTo(0, 0);
-  await new Promise(r => setTimeout(r, 150));
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  await Promise.all(Array.from(document.images)
+    .filter(img => !img.complete && (img.currentSrc || img.src))
+    .map(img => new Promise(r => {
+      img.addEventListener('load', r, { once: true });
+      img.addEventListener('error', r, { once: true });
+      setTimeout(r, 3000);
+    })));
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 })()"#;
 
